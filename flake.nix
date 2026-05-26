@@ -14,6 +14,15 @@
       {
         devShells.default = pkgs.mkShellNoCC {
           packages = with pkgs; [
+            cargo
+            cargo-nextest
+            clippy
+            openssl
+            pkg-config
+            postgresql
+            rustc
+            rustfmt
+            sqlx-cli
           ];
         };
       }
