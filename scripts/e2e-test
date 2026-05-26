@@ -10,7 +10,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 "$repo_root/scripts/dev-env" >/dev/null
-"$repo_root/scripts/load-nix-image" >/dev/null
+"$repo_root/scripts/load-nix-image"
 set -a
 # shellcheck disable=SC1091
 source "$repo_root/.env"

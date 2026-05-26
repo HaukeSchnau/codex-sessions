@@ -11,12 +11,6 @@
       let
         pkgs = import nixpkgs { inherit system; };
         lib = pkgs.lib;
-        imageSystem =
-          if lib.hasSuffix "-darwin" system then
-            lib.replaceStrings [ "-darwin" ] [ "-linux" ] system
-          else
-            system;
-        imagePkgs = import nixpkgs { system = imageSystem; };
         archiveSource = lib.cleanSourceWith {
           src = ./.;
           filter =
@@ -38,20 +32,30 @@
               || lib.hasPrefix "tmp/" rel
             );
         };
-        mkArchivePackage =
-          targetPkgs:
+        mkArchiveCrate =
+          targetPkgs: crateName:
           targetPkgs.rustPlatform.buildRustPackage {
-            pname = "codex-session-archive";
+            pname = crateName;
             version = "0.1.0";
             src = archiveSource;
             cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [ "-p" crateName ];
+            cargoTestFlags = [ "-p" crateName ];
             doCheck = true;
           };
-        archivePackage = mkArchivePackage pkgs;
+        archiveServerPackage = mkArchiveCrate pkgs "archive-server";
+        archiveAgentPackage = mkArchiveCrate pkgs "archive-agent";
+        archivePackage = pkgs.symlinkJoin {
+          name = "codex-session-archive-0.1.0";
+          paths = [
+            archiveServerPackage
+            archiveAgentPackage
+          ];
+        };
         mkArchiveServerImage =
           targetPkgs:
           let
-            targetArchivePackage = mkArchivePackage targetPkgs;
+            targetArchivePackage = mkArchiveCrate targetPkgs "archive-server";
             imageRoot = targetPkgs.buildEnv {
               name = "codex-session-archive-image-root";
               paths = [
@@ -80,6 +84,8 @@
                 ExposedPorts = {
                   "8787/tcp" = { };
                 };
+                User = "65532:65532";
+                WorkingDir = "/";
               };
             }
           else
@@ -92,25 +98,27 @@
               EOF
               exit 1
             '';
-        archiveServerImage = mkArchiveServerImage imagePkgs;
+        archiveServerImage = mkArchiveServerImage pkgs;
       in
       {
         packages = {
           default = archivePackage;
           codex-session-archive = archivePackage;
-          archive-server = archivePackage;
-          archive-agent = archivePackage;
+          archive-server = archiveServerPackage;
+          archive-agent = archiveAgentPackage;
           archive-server-image = archiveServerImage;
         };
 
         apps = {
           archive-server = {
             type = "app";
-            program = "${archivePackage}/bin/archive-server";
+            program = "${archiveServerPackage}/bin/archive-server";
+            meta.description = "Run the Codex session archive HTTP server";
           };
           archive-agent = {
             type = "app";
-            program = "${archivePackage}/bin/archive-agent";
+            program = "${archiveAgentPackage}/bin/archive-agent";
+            meta.description = "Run the Codex session archive local import agent";
           };
         };
 

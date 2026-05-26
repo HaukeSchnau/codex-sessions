@@ -7,25 +7,37 @@ cd "$repo_root"
 image_ref="codex-sessions-archive-server:nix"
 result_link="${ARCHIVE_IMAGE_RESULT:-$repo_root/result-archive-server-image}"
 
-build_target=".#archive-server-image"
-if [[ -n "${ARCHIVE_IMAGE_SYSTEM:-}" ]]; then
-  build_target=".#packages.${ARCHIVE_IMAGE_SYSTEM}.archive-server-image"
-else
+default_image_system() {
+  local current_system
   current_system="$(nix eval --raw --impure --expr builtins.currentSystem)"
-  if [[ "$current_system" == *-darwin ]]; then
-    docker_arch="$(docker version --format '{{.Server.Arch}}')"
-    case "$docker_arch" in
-      arm64 | aarch64) build_target=".#packages.aarch64-linux.archive-server-image" ;;
-      amd64 | x86_64) build_target=".#packages.x86_64-linux.archive-server-image" ;;
-      *)
-        echo "Unsupported Docker architecture: $docker_arch" >&2
-        exit 1
-        ;;
-    esac
-  fi
+  case "$current_system" in
+    aarch64-linux | x86_64-linux) printf '%s\n' "$current_system" ;;
+    *-darwin) printf '%s\n' "aarch64-linux" ;;
+    *)
+      echo "Unsupported host system for Docker image build: $current_system" >&2
+      exit 1
+      ;;
+  esac
+}
+
+image_system="${ARCHIVE_IMAGE_SYSTEM:-$(default_image_system)}"
+case "$image_system" in
+  aarch64-linux | x86_64-linux) ;;
+  *)
+    echo "Unsupported ARCHIVE_IMAGE_SYSTEM: $image_system" >&2
+    echo "Expected aarch64-linux or x86_64-linux." >&2
+    exit 1
+    ;;
+esac
+
+build_target=".#packages.${image_system}.archive-server-image"
+build_args=()
+if [[ -n "${ARCHIVE_IMAGE_MAX_JOBS:-}" ]]; then
+  build_args+=(--max-jobs "$ARCHIVE_IMAGE_MAX_JOBS")
 fi
 
-nix build --max-jobs "${ARCHIVE_IMAGE_MAX_JOBS:-1}" "$build_target" --out-link "$result_link"
+echo "Building $build_target with Nix"
+nix build "${build_args[@]}" "$build_target" --out-link "$result_link"
 docker load --input "$result_link"
 
 echo "Loaded $image_ref"

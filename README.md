@@ -44,14 +44,19 @@ nix build .#archive-server
 nix build .#archive-agent
 ```
 
-Build the Docker image tarball with Nix and load it into Docker:
+Build the Docker image tarball with Nix and load it into Docker on Linux:
 
 ```sh
 nix build .#archive-server-image
 docker load --input result
 ```
 
-On macOS, `./scripts/load-nix-image` automatically builds the Linux image attribute for the architecture used by the local Docker daemon. Set `ARCHIVE_IMAGE_SYSTEM=aarch64-linux` or `ARCHIVE_IMAGE_SYSTEM=x86_64-linux` to override that detection. For a direct manual build of a specific Linux image, use `nix build .#packages.aarch64-linux.archive-server-image` or `nix build .#packages.x86_64-linux.archive-server-image`.
+On macOS, `./scripts/load-nix-image` builds `.#packages.aarch64-linux.archive-server-image` by default, so a configured ARM Linux Nix builder can produce the image without passing `--system`. Set `ARCHIVE_IMAGE_SYSTEM=x86_64-linux` only when you intentionally want the x86_64 Linux image. For a direct manual ARM image build, use:
+
+```sh
+nix build .#packages.aarch64-linux.archive-server-image
+docker load --input result
+```
 
 Required environment:
 

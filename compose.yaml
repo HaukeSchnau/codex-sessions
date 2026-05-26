@@ -17,6 +17,7 @@ services:
 
   archive-server:
     image: codex-sessions-archive-server:nix
+    pull_policy: never
     depends_on:
       postgres:
         condition: service_healthy
