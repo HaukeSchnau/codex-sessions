@@ -6,7 +6,7 @@ use archive_core::{
     chunk_rollout_lines, parse_thread_name_update, AgentBatch, Chunk, FileKind, IngestResponse,
     RolloutLine,
 };
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -41,6 +41,7 @@ struct Config {
     embedding_model: String,
     embedding_dimensions: i32,
     bind_addr: SocketAddr,
+    max_ingest_body_bytes: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -195,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/search", get(search))
         .route("/v1/query", post(query))
         .route("/v1/export", get(export_jsonl))
+        .layer(DefaultBodyLimit::max(config.max_ingest_body_bytes))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -224,6 +226,10 @@ impl Config {
                 .unwrap_or_else(|_| "127.0.0.1:8787".to_string())
                 .parse()
                 .context("parse BIND_ADDR")?,
+            max_ingest_body_bytes: std::env::var("ARCHIVE_MAX_INGEST_BODY_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(64 * 1024 * 1024),
         })
     }
 }
@@ -588,8 +594,8 @@ async fn ingest_rollout(
         .bind(agent_line.byte_end as i64)
         .bind(line.timestamp)
         .bind(&line.item_type)
-        .bind(&line.raw)
-        .bind(&line.payload)
+        .bind(postgres_jsonb(&line.raw))
+        .bind(postgres_jsonb(&line.payload))
         .bind(&agent_line.content_hash)
         .execute(&mut **tx)
         .await?;
@@ -748,7 +754,7 @@ async fn upsert_thread_from_meta(
     .bind(&meta.thread_id)
     .bind(&meta.cwd)
     .bind(&meta.source)
-    .bind(&meta.thread_source)
+    .bind(postgres_jsonb_option(&meta.thread_source))
     .bind(&meta.agent_nickname)
     .bind(&meta.agent_role)
     .bind(&meta.agent_path)
@@ -787,10 +793,10 @@ async fn insert_chunks(
         .bind(&chunk.turn_id)
         .bind(chunk.chunk_kind.as_str())
         .bind(&chunk.role)
-        .bind(&chunk.text)
+        .bind(postgres_text(&chunk.text))
         .bind(chunk.start_line)
         .bind(chunk.end_line)
-        .bind(&chunk.metadata)
+        .bind(postgres_jsonb(&chunk.metadata))
         .bind(&chunk.content_hash)
         .fetch_optional(&mut **tx)
         .await?;
@@ -1064,6 +1070,41 @@ fn require_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
     }
 }
 
+fn postgres_jsonb(value: &Value) -> Value {
+    let mut value = value.clone();
+    sanitize_json_for_postgres(&mut value);
+    value
+}
+
+fn postgres_jsonb_option(value: &Option<Value>) -> Option<Value> {
+    value.as_ref().map(postgres_jsonb)
+}
+
+fn postgres_text(text: &str) -> String {
+    text.replace('\0', "\\u0000")
+}
+
+fn sanitize_json_for_postgres(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            if text.contains('\0') {
+                *text = postgres_text(text);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_json_for_postgres(item);
+            }
+        }
+        Value::Object(object) => {
+            for item in object.values_mut() {
+                sanitize_json_for_postgres(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 fn thread_summary_from_row(row: sqlx::postgres::PgRow) -> ThreadSummary {
     ThreadSummary {
         thread_id: row.get("thread_id"),
@@ -1149,5 +1190,19 @@ mod tests {
                 .unwrap_or_else(|_| "text-embedding-3-small".to_string()),
             "text-embedding-3-small"
         );
+    }
+
+    #[test]
+    fn postgres_jsonb_escapes_nul_characters() {
+        let value = json!({
+            "payload": {
+                "text": "before\u{0}after",
+                "nested": ["ok", "\u{0}"]
+            }
+        });
+        let sanitized = postgres_jsonb(&value);
+
+        assert_eq!(sanitized["payload"]["text"], "before\\u0000after");
+        assert_eq!(sanitized["payload"]["nested"][1], "\\u0000");
     }
 }

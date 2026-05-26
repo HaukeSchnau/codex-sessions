@@ -18,19 +18,10 @@
             let
               rel = lib.removePrefix ((toString ./.) + "/") (toString path);
             in
-            !(
-              rel == ".env"
-              || rel == "Dockerfile"
-              || rel == ".dockerignore"
-              || rel == "result"
-              || lib.hasPrefix "result-" rel
-              || lib.hasPrefix ".git/" rel
-              || lib.hasPrefix ".jj/" rel
-              || lib.hasPrefix ".sops/" rel
-              || lib.hasPrefix ".direnv/" rel
-              || lib.hasPrefix "target/" rel
-              || lib.hasPrefix "tmp/" rel
-            );
+            rel == "Cargo.lock"
+            || rel == "Cargo.toml"
+            || rel == "crates"
+            || lib.hasPrefix "crates/" rel;
         };
         mkArchiveCrate =
           targetPkgs: crateName:

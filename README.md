@@ -72,6 +72,7 @@ Optional:
 ```sh
 export OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 export EMBEDDING_DIMENSIONS=1536
+export ARCHIVE_MAX_INGEST_BODY_BYTES=67108864
 export BIND_ADDR=127.0.0.1:8787
 ```
 
