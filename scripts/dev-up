@@ -5,7 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 "$repo_root/scripts/dev-env" >/dev/null
-docker compose up -d --build --force-recreate postgres archive-server
+"$repo_root/scripts/load-nix-image" >/dev/null
+docker compose up -d --force-recreate postgres archive-server
 
 echo "archive-server: http://127.0.0.1:${ARCHIVE_SERVER_PORT:-8787}"
 echo "postgres:       127.0.0.1:${POSTGRES_PORT:-55432}"

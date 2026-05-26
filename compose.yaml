@@ -16,8 +16,7 @@ services:
       retries: 30
 
   archive-server:
-    build:
-      context: .
+    image: codex-sessions-archive-server:nix
     depends_on:
       postgres:
         condition: service_healthy

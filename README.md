@@ -12,13 +12,13 @@ Central archive/search service for Codex rollout JSONL.
 
 ## Local Stack
 
-This repo can run its required services with Docker Compose:
+This repo can run its required services with Docker Compose. The archive service image is built by Nix; there is no Dockerfile build path.
 
 ```sh
 ./scripts/dev-up
 ```
 
-`scripts/dev-up` decrypts `secrets/dev.enc.yaml` with SOPS into a local ignored `.env`, starts Postgres with `pgvector`, builds `archive-server`, runs migrations on boot, and exposes:
+`scripts/dev-up` decrypts `secrets/dev.enc.yaml` with SOPS into a local ignored `.env`, builds and loads the `archive-server` Docker image with Nix, starts Postgres with `pgvector`, runs migrations on boot, and exposes:
 
 - archive-server: `http://127.0.0.1:8787`
 - Postgres: `127.0.0.1:55432`
@@ -36,6 +36,22 @@ Run the end-to-end fixture import and search/export checks:
 ```
 
 The SOPS age private key is expected at `.sops/age.key` by default and is intentionally ignored by version control. Set `SOPS_AGE_KEY_FILE` to use a different key.
+
+Build the regular binaries with Nix:
+
+```sh
+nix build .#archive-server
+nix build .#archive-agent
+```
+
+Build the Docker image tarball with Nix and load it into Docker:
+
+```sh
+nix build .#archive-server-image
+docker load --input result
+```
+
+On macOS, `./scripts/load-nix-image` automatically builds the Linux image attribute for the architecture used by the local Docker daemon. Set `ARCHIVE_IMAGE_SYSTEM=aarch64-linux` or `ARCHIVE_IMAGE_SYSTEM=x86_64-linux` to override that detection. For a direct manual build of a specific Linux image, use `nix build .#packages.aarch64-linux.archive-server-image` or `nix build .#packages.x86_64-linux.archive-server-image`.
 
 Required environment:
 

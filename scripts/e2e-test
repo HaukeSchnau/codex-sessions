@@ -10,12 +10,13 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 "$repo_root/scripts/dev-env" >/dev/null
+"$repo_root/scripts/load-nix-image" >/dev/null
 set -a
 # shellcheck disable=SC1091
 source "$repo_root/.env"
 set +a
 
-docker compose up -d --build --force-recreate postgres archive-server
+docker compose up -d --force-recreate postgres archive-server
 
 base_url="http://127.0.0.1:${ARCHIVE_SERVER_PORT:-8787}"
 for _ in $(seq 1 90); do
