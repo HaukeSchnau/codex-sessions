@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required. Enter the dev shell or install it with nixpkgs#jq." >&2
+  exit 1
+fi
+
+"$repo_root/scripts/dev-env" >/dev/null
+set -a
+# shellcheck disable=SC1091
+source "$repo_root/.env"
+set +a
+
+docker compose up -d --build --force-recreate postgres archive-server
+
+base_url="http://127.0.0.1:${ARCHIVE_SERVER_PORT:-8787}"
+for _ in $(seq 1 90); do
+  if curl -fsS "$base_url/readyz" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+curl -fsS "$base_url/readyz" >/dev/null
+
+fixture_home="$repo_root/tmp/e2e-codex-home"
+rm -rf "$fixture_home"
+mkdir -p "$fixture_home/sessions/2026/05/27"
+
+thread_id="thread-e2e-$(date +%s)-$$"
+sentinel="codex-archive-e2e-$(date +%s)-$$"
+rollout="$fixture_home/sessions/2026/05/27/rollout-${thread_id}.jsonl"
+
+cat >"$rollout" <<JSONL
+{"timestamp":"2026-05-27T12:00:00Z","type":"session_meta","payload":{"id":"$thread_id","timestamp":"2026-05-27T12:00:00Z","cwd":"/tmp/codex-archive-e2e","source":"cli","model_provider":"openai","cli_version":"e2e","git":{"branch":"main","commit_hash":"abc123","repository_url":"https://example.invalid/repo.git"}}}
+{"timestamp":"2026-05-27T12:01:00Z","type":"turn_context","payload":{"turn_id":"turn-1"}}
+{"timestamp":"2026-05-27T12:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"Please remember the $sentinel nebula indexing decision."}}
+{"timestamp":"2026-05-27T12:03:00Z","type":"event_msg","payload":{"type":"agent_message","message":"The archive should use Postgres full text search, pgvector semantic search, and reciprocal rank fusion."}}
+{"timestamp":"2026-05-27T12:04:00Z","type":"event_msg","payload":{"type":"exec_command_end","command":["echo","$sentinel"],"status":"completed","formatted_output":"$sentinel command output"}}
+{"timestamp":"2026-05-27T12:05:00Z","type":"event_msg","payload":{"type":"agent_reasoning_raw_content","text":"private trace $sentinel"}}
+JSONL
+
+cat >"$fixture_home/session_index.jsonl" <<JSONL
+{"id":"$thread_id","thread_name":"E2E Archive Thread $sentinel","updated_at":"2026-05-27T12:06:00Z"}
+JSONL
+
+cargo run -q -p archive-agent -- scan \
+  --server "$base_url" \
+  --token "$ARCHIVE_INGEST_TOKEN" \
+  --codex-home "$fixture_home"
+
+threads="$(curl -fsS -H "Authorization: Bearer $ARCHIVE_READ_TOKEN" "$base_url/v1/threads?q=$sentinel")"
+jq -e --arg thread_id "$thread_id" 'map(.thread_id == $thread_id) | any' <<<"$threads" >/dev/null
+
+keyword="$(curl -fsS -H "Authorization: Bearer $ARCHIVE_READ_TOKEN" "$base_url/v1/search?q=$sentinel&mode=keyword")"
+jq -e --arg sentinel "$sentinel" 'length > 0 and any(.[]; .text | contains($sentinel))' <<<"$keyword" >/dev/null
+
+query_result="$(curl -fsS -X POST -H "Authorization: Bearer $ARCHIVE_READ_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"query\":\"$sentinel\",\"mode\":\"keyword\",\"limit\":5}" \
+  "$base_url/v1/query")"
+jq -e --arg sentinel "$sentinel" '(.results | length > 0) and any(.results[]; .text | contains($sentinel))' <<<"$query_result" >/dev/null
+
+raw_default="$(curl -fsS -H "Authorization: Bearer $ARCHIVE_READ_TOKEN" "$base_url/v1/threads/$thread_id/raw?format=json")"
+jq -e --arg sentinel "$sentinel" '([.raw[].payload.type] | index("agent_reasoning_raw_content") | not) and (.raw | tostring | contains($sentinel))' <<<"$raw_default" >/dev/null
+
+raw_private="$(curl -fsS -H "Authorization: Bearer $ARCHIVE_READ_TOKEN" "$base_url/v1/threads/$thread_id/raw?format=json&include_private_model_traces=true")"
+jq -e '[.raw[].payload.type] | index("agent_reasoning_raw_content") != null' <<<"$raw_private" >/dev/null
+
+for _ in $(seq 1 60); do
+  status_counts="$(docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT status || ':' || count(*) FROM embedding_jobs GROUP BY status ORDER BY status")"
+  if grep -q '^done:' <<<"$status_counts" && ! grep -qE '^(pending|running|failed):' <<<"$status_counts"; then
+    break
+  fi
+  sleep 2
+done
+
+status_counts="$(docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT status || ':' || count(*) FROM embedding_jobs GROUP BY status ORDER BY status")"
+if grep -qE '^(pending|running|failed):' <<<"$status_counts" || ! grep -q '^done:' <<<"$status_counts"; then
+  echo "Embedding jobs did not complete:" >&2
+  echo "$status_counts" >&2
+  docker compose logs --no-color --tail=80 archive-server >&2
+  exit 1
+fi
+
+semantic="$(curl -fsS -H "Authorization: Bearer $ARCHIVE_READ_TOKEN" "$base_url/v1/search?q=semantic%20search%20reciprocal%20rank%20fusion&mode=semantic")"
+jq -e 'length > 0' <<<"$semantic" >/dev/null
+
+exported="$(curl -fsS -H "Authorization: Bearer $ARCHIVE_READ_TOKEN" "$base_url/v1/export")"
+grep -F "$thread_id" <<<"$exported" >/dev/null
+
+echo "E2E passed for $thread_id"

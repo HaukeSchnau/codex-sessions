@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+secret_file="${SOPS_SECRET_FILE:-$repo_root/secrets/dev.enc.yaml}"
+age_key_file="${SOPS_AGE_KEY_FILE:-$repo_root/.sops/age.key}"
+env_file="${ARCHIVE_ENV_FILE:-$repo_root/.env}"
+
+if [[ ! -f "$secret_file" ]]; then
+  echo "Missing encrypted secret file: $secret_file" >&2
+  exit 1
+fi
+
+if [[ ! -f "$age_key_file" ]]; then
+  echo "Missing SOPS age key: $age_key_file" >&2
+  echo "Set SOPS_AGE_KEY_FILE to a key that can decrypt $secret_file." >&2
+  exit 1
+fi
+
+if ! command -v sops >/dev/null 2>&1; then
+  echo "sops is required. Enter the dev shell or install it with nixpkgs#sops." >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required. Enter the dev shell or install it with nixpkgs#jq." >&2
+  exit 1
+fi
+
+json="$(SOPS_AGE_KEY_FILE="$age_key_file" sops --decrypt --output-type json "$secret_file")"
+tmp="$(mktemp "$repo_root/.env.tmp.XXXXXX")"
+chmod 600 "$tmp"
+
+{
+  printf 'POSTGRES_USER=%s\n' "codex_archive"
+  printf 'POSTGRES_DB=%s\n' "codex_archive"
+  printf 'POSTGRES_PORT=%s\n' "55432"
+  printf 'ARCHIVE_SERVER_PORT=%s\n' "8787"
+  printf 'POSTGRES_PASSWORD=%s\n' "$(jq -r '.postgres_password' <<<"$json")"
+  printf 'ARCHIVE_INGEST_TOKEN=%s\n' "$(jq -r '.archive_ingest_token' <<<"$json")"
+  printf 'ARCHIVE_READ_TOKEN=%s\n' "$(jq -r '.archive_read_token' <<<"$json")"
+  printf 'OPENAI_API_KEY=%s\n' "$(jq -r '.openai_api_key' <<<"$json")"
+  printf 'OPENAI_EMBEDDING_MODEL=%s\n' "$(jq -r '.openai_embedding_model // "text-embedding-3-small"' <<<"$json")"
+  printf 'EMBEDDING_DIMENSIONS=%s\n' "$(jq -r '.embedding_dimensions // 1536' <<<"$json")"
+} >"$tmp"
+
+mv "$tmp" "$env_file"
+chmod 600 "$env_file"
+echo "Wrote $env_file"

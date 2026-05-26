@@ -17,11 +17,15 @@
             cargo
             cargo-nextest
             clippy
+            age
+            docker-compose
+            jq
             openssl
             pkg-config
             postgresql
             rustc
             rustfmt
+            sops
             sqlx-cli
           ];
         };

@@ -10,7 +10,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://example.invalid/codex-sessions"
-rust-version = "1.82"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -1,0 +1,6 @@
+.env
+.git
+.jj
+.sops
+target
+tmp

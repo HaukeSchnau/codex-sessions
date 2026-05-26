@@ -10,6 +10,33 @@ Central archive/search service for Codex rollout JSONL.
 
 ## Server
 
+## Local Stack
+
+This repo can run its required services with Docker Compose:
+
+```sh
+./scripts/dev-up
+```
+
+`scripts/dev-up` decrypts `secrets/dev.enc.yaml` with SOPS into a local ignored `.env`, starts Postgres with `pgvector`, builds `archive-server`, runs migrations on boot, and exposes:
+
+- archive-server: `http://127.0.0.1:8787`
+- Postgres: `127.0.0.1:55432`
+
+Stop services:
+
+```sh
+./scripts/dev-down
+```
+
+Run the end-to-end fixture import and search/export checks:
+
+```sh
+./scripts/e2e-test
+```
+
+The SOPS age private key is expected at `.sops/age.key` by default and is intentionally ignored by version control. Set `SOPS_AGE_KEY_FILE` to use a different key.
+
 Required environment:
 
 ```sh
