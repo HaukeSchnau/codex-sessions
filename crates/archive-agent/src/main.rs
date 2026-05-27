@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,7 @@ use walkdir::WalkDir;
 const PREFIX_HASH_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_LINES_PER_BATCH: usize = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 600;
+const DEFAULT_PRUNE_MIN_AGE_DAYS: u64 = 30;
 
 #[derive(Debug, Parser)]
 #[command(name = "archive-agent")]
@@ -31,10 +33,11 @@ struct Cli {
 enum Command {
     Scan(AgentOptions),
     Watch(WatchOptions),
+    Prune(PruneOptions),
 }
 
 #[derive(Debug, Parser, Clone)]
-struct AgentOptions {
+struct CommonOptions {
     #[arg(long, env = "ARCHIVE_SERVER_URL")]
     server: String,
     #[arg(long, env = "ARCHIVE_INGEST_TOKEN", conflicts_with = "token_file")]
@@ -43,8 +46,6 @@ struct AgentOptions {
     token_file: Option<PathBuf>,
     #[arg(long, env = "CODEX_HOME", default_value = "~/.codex")]
     codex_home: PathBuf,
-    #[arg(long, default_value_t = DEFAULT_MAX_LINES_PER_BATCH)]
-    max_lines_per_batch: usize,
     #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECONDS)]
     request_timeout_seconds: u64,
     #[arg(long)]
@@ -54,11 +55,31 @@ struct AgentOptions {
 }
 
 #[derive(Debug, Parser, Clone)]
+struct AgentOptions {
+    #[command(flatten)]
+    common: CommonOptions,
+    #[arg(long, default_value_t = DEFAULT_MAX_LINES_PER_BATCH)]
+    max_lines_per_batch: usize,
+}
+
+#[derive(Debug, Parser, Clone)]
 struct WatchOptions {
     #[command(flatten)]
     agent: AgentOptions,
     #[arg(long, default_value_t = 30)]
     interval_seconds: u64,
+}
+
+#[derive(Debug, Parser, Clone)]
+struct PruneOptions {
+    #[command(flatten)]
+    common: CommonOptions,
+    #[arg(long, default_value_t = DEFAULT_PRUNE_MIN_AGE_DAYS)]
+    min_age_days: u64,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    skip_archived_sessions: bool,
 }
 
 #[tokio::main]
@@ -71,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Scan(options) => scan_once(options).await,
         Command::Watch(options) => watch(options).await,
+        Command::Prune(options) => prune_once(options).await,
     }
 }
 
@@ -87,18 +109,22 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
     if options.max_lines_per_batch == 0 {
         bail!("--max-lines-per-batch must be greater than zero");
     }
-    if options.request_timeout_seconds == 0 {
+    if options.common.request_timeout_seconds == 0 {
         bail!("--request-timeout-seconds must be greater than zero");
     }
-    let token = ingest_token(&options)?;
-    let codex_home = expand_tilde(options.codex_home.clone());
+    let token = ingest_token(&options.common)?;
+    let codex_home = expand_tilde(options.common.codex_home.clone());
     let machine = machine_identity(&codex_home)?;
     let client = Client::builder()
-        .timeout(Duration::from_secs(options.request_timeout_seconds))
+        .timeout(Duration::from_secs(options.common.request_timeout_seconds))
         .build()
         .context("build HTTP client")?;
-    let endpoint = format!("{}/v1/ingest/batch", options.server.trim_end_matches('/'));
-    let cursors = fetch_cursors(&client, &options, &token, &machine.machine_id).await?;
+    let endpoint = format!(
+        "{}/v1/ingest/batch",
+        options.common.server.trim_end_matches('/')
+    );
+    let cursors =
+        fetch_cursors(&client, &options.common.server, &token, &machine.machine_id).await?;
 
     let mut files = discover_files(&codex_home)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -114,7 +140,7 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
             if file_metadata_matches_cursor(&discovered.path, cursor)? {
                 stats.skipped_files += 1;
                 emit_progress(
-                    &options,
+                    &options.common,
                     "skipped",
                     index + 1,
                     total_files,
@@ -134,7 +160,7 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
         if upload_lines.is_empty() {
             stats.skipped_files += 1;
             emit_progress(
-                &options,
+                &options.common,
                 "skipped",
                 index + 1,
                 total_files,
@@ -184,7 +210,7 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
             );
         }
         emit_progress(
-            &options,
+            &options.common,
             "uploaded",
             index + 1,
             total_files,
@@ -193,11 +219,104 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
         );
     }
     stats.elapsed_ms = started.elapsed().as_millis() as u64;
-    emit_summary(&options, &stats);
+    emit_summary(&options.common, &stats);
     Ok(())
 }
 
-fn ingest_token(options: &AgentOptions) -> anyhow::Result<String> {
+async fn prune_once(options: PruneOptions) -> anyhow::Result<()> {
+    if options.common.request_timeout_seconds == 0 {
+        bail!("--request-timeout-seconds must be greater than zero");
+    }
+    if options.min_age_days == 0 {
+        bail!("--min-age-days must be greater than zero");
+    }
+    let token = ingest_token(&options.common)?;
+    let codex_home = expand_tilde(options.common.codex_home.clone());
+    let machine = machine_identity(&codex_home)?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(options.common.request_timeout_seconds))
+        .build()
+        .context("build HTTP client")?;
+    let cursors =
+        fetch_cursors(&client, &options.common.server, &token, &machine.machine_id).await?;
+
+    let mut files = discover_files(&codex_home)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let total_files = files.len();
+    let started = Instant::now();
+    let mut stats = PruneStats {
+        discovered_files: total_files,
+        ..Default::default()
+    };
+    let now = Utc::now();
+
+    for (index, discovered) in files.into_iter().enumerate() {
+        if discovered.kind == FileKind::SessionIndex {
+            stats.non_rollout_files += 1;
+            continue;
+        }
+        if options.skip_archived_sessions && discovered.kind == FileKind::ArchivedRollout {
+            stats.skipped_archived_files += 1;
+            continue;
+        }
+
+        let prepared = prepare_file(&codex_home, &discovered)?;
+        if prepared.complete_len == 0 {
+            stats.empty_files += 1;
+            continue;
+        }
+
+        let Some(modified_at) = prepared.metadata.modified_at else {
+            stats.unconfirmed_files += 1;
+            continue;
+        };
+        if !is_past_min_age(modified_at, now, options.min_age_days) {
+            stats.recent_files += 1;
+            continue;
+        }
+
+        let cursor = cursors.get(&prepared.metadata.relative_path);
+        if !file_fully_archived(&prepared, cursor) {
+            stats.unconfirmed_files += 1;
+            continue;
+        }
+
+        stats.eligible_files += 1;
+        stats.eligible_bytes += prepared.metadata.size_bytes;
+        if options.dry_run {
+            stats.dry_run_files += 1;
+            emit_prune_progress(
+                &options.common,
+                "would_delete",
+                index + 1,
+                total_files,
+                &prepared.metadata.relative_path,
+                &stats,
+            );
+            continue;
+        }
+
+        fs::remove_file(&prepared.path)
+            .with_context(|| format!("delete {}", prepared.path.display()))?;
+        prune_empty_rollout_dirs(&codex_home, &prepared)?;
+        stats.deleted_files += 1;
+        stats.deleted_bytes += prepared.metadata.size_bytes;
+        emit_prune_progress(
+            &options.common,
+            "deleted",
+            index + 1,
+            total_files,
+            &prepared.metadata.relative_path,
+            &stats,
+        );
+    }
+
+    stats.elapsed_ms = started.elapsed().as_millis() as u64;
+    emit_prune_summary(&options.common, &stats);
+    Ok(())
+}
+
+fn ingest_token(options: &CommonOptions) -> anyhow::Result<String> {
     match (&options.token, &options.token_file) {
         (Some(token), None) => Ok(token.clone()),
         (None, Some(path)) => fs::read_to_string(path)
@@ -228,6 +347,22 @@ struct ScanStats {
     elapsed_ms: u64,
 }
 
+#[derive(Debug, Default)]
+struct PruneStats {
+    discovered_files: usize,
+    eligible_files: usize,
+    eligible_bytes: u64,
+    dry_run_files: usize,
+    deleted_files: usize,
+    deleted_bytes: u64,
+    recent_files: usize,
+    unconfirmed_files: usize,
+    empty_files: usize,
+    non_rollout_files: usize,
+    skipped_archived_files: usize,
+    elapsed_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 struct DiscoveredFile {
     path: PathBuf,
@@ -236,6 +371,7 @@ struct DiscoveredFile {
 
 #[derive(Debug, Clone)]
 struct PreparedFile {
+    path: PathBuf,
     metadata: AgentFileMetadata,
     complete_len: usize,
     bytes: Vec<u8>,
@@ -293,6 +429,7 @@ fn prepare_file(codex_home: &Path, discovered: &DiscoveredFile) -> anyhow::Resul
     let prefix_hash = sha256_hex(&bytes[..bytes.len().min(PREFIX_HASH_BYTES)]);
 
     Ok(PreparedFile {
+        path: discovered.path.clone(),
         metadata: AgentFileMetadata {
             relative_path,
             kind: discovered.kind.clone(),
@@ -329,13 +466,13 @@ fn file_metadata_matches_cursor(path: &Path, cursor: &FileCursor) -> anyhow::Res
 
 async fn fetch_cursors(
     client: &Client,
-    options: &AgentOptions,
+    server: &str,
     token: &str,
     machine_id: &str,
 ) -> anyhow::Result<HashMap<String, FileCursor>> {
     let endpoint = format!(
         "{}/v1/ingest/cursors?machine_id={}",
-        options.server.trim_end_matches('/'),
+        server.trim_end_matches('/'),
         machine_id
     );
     let response = client
@@ -363,19 +500,10 @@ fn lines_to_upload(
     let Some(cursor) = cursor else {
         return complete_lines(&prepared.bytes[..prepared.complete_len]);
     };
-    let prefix_len = (cursor.size_bytes.min(prepared.metadata.size_bytes))
-        .min(PREFIX_HASH_BYTES as u64) as usize;
-    let prefix_matches = prepared
-        .bytes
-        .get(..prefix_len)
-        .map(|prefix| sha256_hex(prefix) == cursor.prefix_hash)
-        .unwrap_or(false);
-    let append_only_match = prefix_matches
+    let append_only_match = cursor_prefix_matches(prepared, cursor)
         && cursor.size_bytes <= prepared.metadata.size_bytes
         && cursor.file_hash != prepared.metadata.file_hash;
-    let fully_imported = cursor.file_hash == prepared.metadata.file_hash
-        && cursor.size_bytes == prepared.metadata.size_bytes
-        && cursor.import_byte_cursor >= prepared.complete_len as u64;
+    let fully_imported = file_fully_archived(prepared, Some(cursor));
     if fully_imported {
         return Ok(Vec::new());
     }
@@ -391,7 +519,7 @@ fn lines_to_upload(
 }
 
 fn emit_progress(
-    options: &AgentOptions,
+    options: &CommonOptions,
     event: &str,
     current: usize,
     total: usize,
@@ -430,7 +558,7 @@ fn emit_progress(
     }
 }
 
-fn emit_summary(options: &AgentOptions, stats: &ScanStats) {
+fn emit_summary(options: &CommonOptions, stats: &ScanStats) {
     if options.quiet {
         return;
     }
@@ -463,6 +591,147 @@ fn emit_summary(options: &AgentOptions, stats: &ScanStats) {
             stats.quarantined_lines,
             stats.elapsed_ms
         );
+    }
+}
+
+fn emit_prune_progress(
+    options: &CommonOptions,
+    event: &str,
+    current: usize,
+    total: usize,
+    relative_path: &str,
+    stats: &PruneStats,
+) {
+    if options.quiet {
+        return;
+    }
+    if options.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": event,
+                "current_file": current,
+                "total_files": total,
+                "relative_path": relative_path,
+                "eligible_files": stats.eligible_files,
+                "dry_run_files": stats.dry_run_files,
+                "deleted_files": stats.deleted_files,
+                "deleted_bytes": stats.deleted_bytes,
+                "recent_files": stats.recent_files,
+                "unconfirmed_files": stats.unconfirmed_files,
+            })
+        );
+    } else if event == "deleted"
+        || event == "would_delete"
+        || current == total
+        || current.is_multiple_of(100)
+    {
+        eprintln!(
+            "[{current}/{total}] {event} {} (eligible={}, dry_run={}, deleted={}, deleted_bytes={}, recent={}, unconfirmed={})",
+            relative_path,
+            stats.eligible_files,
+            stats.dry_run_files,
+            stats.deleted_files,
+            stats.deleted_bytes,
+            stats.recent_files,
+            stats.unconfirmed_files
+        );
+    }
+}
+
+fn emit_prune_summary(options: &CommonOptions, stats: &PruneStats) {
+    if options.quiet {
+        return;
+    }
+    if options.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "summary",
+                "discovered_files": stats.discovered_files,
+                "eligible_files": stats.eligible_files,
+                "eligible_bytes": stats.eligible_bytes,
+                "dry_run_files": stats.dry_run_files,
+                "deleted_files": stats.deleted_files,
+                "deleted_bytes": stats.deleted_bytes,
+                "recent_files": stats.recent_files,
+                "unconfirmed_files": stats.unconfirmed_files,
+                "empty_files": stats.empty_files,
+                "non_rollout_files": stats.non_rollout_files,
+                "skipped_archived_files": stats.skipped_archived_files,
+                "elapsed_ms": stats.elapsed_ms,
+            })
+        );
+    } else {
+        eprintln!(
+            "prune complete: discovered={}, eligible={}, dry_run={}, deleted={}, deleted_bytes={}, recent={}, unconfirmed={}, empty={}, skipped_archived={}, elapsed_ms={}",
+            stats.discovered_files,
+            stats.eligible_files,
+            stats.dry_run_files,
+            stats.deleted_files,
+            stats.deleted_bytes,
+            stats.recent_files,
+            stats.unconfirmed_files,
+            stats.empty_files,
+            stats.skipped_archived_files,
+            stats.elapsed_ms
+        );
+    }
+}
+
+fn cursor_prefix_matches(prepared: &PreparedFile, cursor: &FileCursor) -> bool {
+    let prefix_len = (cursor.size_bytes.min(prepared.metadata.size_bytes))
+        .min(PREFIX_HASH_BYTES as u64) as usize;
+    prepared
+        .bytes
+        .get(..prefix_len)
+        .map(|prefix| sha256_hex(prefix) == cursor.prefix_hash)
+        .unwrap_or(false)
+}
+
+fn file_fully_archived(prepared: &PreparedFile, cursor: Option<&FileCursor>) -> bool {
+    let Some(cursor) = cursor else {
+        return false;
+    };
+    cursor.file_hash == prepared.metadata.file_hash
+        && cursor.size_bytes == prepared.metadata.size_bytes
+        && cursor.import_byte_cursor >= prepared.complete_len as u64
+}
+
+fn is_past_min_age(modified_at: DateTime<Utc>, now: DateTime<Utc>, min_age_days: u64) -> bool {
+    let Ok(days) = i64::try_from(min_age_days) else {
+        return false;
+    };
+    modified_at <= now - chrono::Duration::days(days)
+}
+
+fn prune_empty_rollout_dirs(codex_home: &Path, prepared: &PreparedFile) -> anyhow::Result<()> {
+    let Some(root) = rollout_root(codex_home, &prepared.metadata.kind) else {
+        return Ok(());
+    };
+    let mut current = prepared.path.parent();
+    while let Some(dir) = current {
+        if dir == root {
+            break;
+        }
+        if !dir.starts_with(&root) {
+            break;
+        }
+        match fs::remove_dir(dir) {
+            Ok(()) => current = dir.parent(),
+            Err(err) if err.kind() == ErrorKind::NotFound => current = dir.parent(),
+            Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => break,
+            Err(err) => return Err(err).with_context(|| format!("remove dir {}", dir.display())),
+        }
+    }
+    Ok(())
+}
+
+fn rollout_root(codex_home: &Path, kind: &FileKind) -> Option<PathBuf> {
+    match kind {
+        FileKind::ActiveRollout => Some(codex_home.join("sessions")),
+        FileKind::ArchivedRollout => Some(codex_home.join("archived_sessions")),
+        FileKind::SessionIndex => None,
     }
 }
 
@@ -597,9 +866,67 @@ mod tests {
         assert_eq!(upload[1].raw, "two");
     }
 
+    #[test]
+    fn fully_archived_requires_exact_hash_and_full_cursor() {
+        let prepared = prepared_with_bytes("sessions/2026/05/27/rollout-a.jsonl", b"one\ntwo\n");
+        let mut cursor = cursor_for(&prepared, prepared.complete_len as u64);
+        assert!(file_fully_archived(&prepared, Some(&cursor)));
+
+        cursor.file_hash = "different".to_string();
+        assert!(!file_fully_archived(&prepared, Some(&cursor)));
+    }
+
+    #[test]
+    fn min_age_gate_uses_whole_days() {
+        let now = DateTime::parse_from_rfc3339("2026-05-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let recent = DateTime::parse_from_rfc3339("2026-04-28T12:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let old_enough = DateTime::parse_from_rfc3339("2026-04-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert!(!is_past_min_age(recent, now, 30));
+        assert!(is_past_min_age(old_enough, now, 30));
+    }
+
+    #[test]
+    fn prune_removes_empty_rollout_dirs_without_touching_root() {
+        let unique = Uuid::new_v4().to_string();
+        let codex_home = std::env::temp_dir().join(format!("archive-agent-prune-{unique}"));
+        let day_dir = codex_home.join("sessions/2026/05/27");
+        fs::create_dir_all(&day_dir).unwrap();
+        let file_path = day_dir.join("rollout-a.jsonl");
+        fs::write(&file_path, b"one\n").unwrap();
+
+        let prepared = PreparedFile {
+            path: file_path.clone(),
+            metadata: AgentFileMetadata {
+                relative_path: "sessions/2026/05/27/rollout-a.jsonl".to_string(),
+                kind: FileKind::ActiveRollout,
+                size_bytes: 4,
+                modified_at: None,
+                file_hash: sha256_hex(b"one\n"),
+                prefix_hash: sha256_hex(b"one\n"),
+            },
+            complete_len: 4,
+            bytes: b"one\n".to_vec(),
+        };
+
+        fs::remove_file(&file_path).unwrap();
+        prune_empty_rollout_dirs(&codex_home, &prepared).unwrap();
+
+        assert!(codex_home.join("sessions").exists());
+        assert!(!day_dir.exists());
+        fs::remove_dir_all(&codex_home).unwrap();
+    }
+
     fn prepared_with_bytes(relative_path: &str, bytes: &[u8]) -> PreparedFile {
         let complete_len = complete_prefix_len(bytes);
         PreparedFile {
+            path: PathBuf::from(relative_path),
             metadata: AgentFileMetadata {
                 relative_path: relative_path.to_string(),
                 kind: FileKind::ActiveRollout,

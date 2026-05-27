@@ -9,16 +9,47 @@ let
   cfg = config.services.codexSessionArchiveAgent;
   system = pkgs.stdenv.hostPlatform.system;
   logDir = "${config.home.homeDirectory}/Library/Logs/codex-session-archive";
+  runAgentArgs = lib.escapeShellArgs [
+    "watch"
+    "--server"
+    cfg.serverUrl
+    "--token-file"
+    (toString cfg.ingestTokenFile)
+    "--codex-home"
+    cfg.codexHome
+    "--max-lines-per-batch"
+    (toString cfg.maxLinesPerBatch)
+    "--request-timeout-seconds"
+    (toString cfg.requestTimeoutSeconds)
+    "--interval-seconds"
+    (toString cfg.intervalSeconds)
+    "--quiet"
+  ];
+  runPruneArgs = lib.escapeShellArgs (
+    [
+      "prune"
+      "--server"
+      cfg.serverUrl
+      "--token-file"
+      (toString cfg.ingestTokenFile)
+      "--codex-home"
+      cfg.codexHome
+      "--request-timeout-seconds"
+      (toString cfg.requestTimeoutSeconds)
+      "--min-age-days"
+      (toString cfg.prune.minAgeDays)
+      "--quiet"
+    ]
+    ++ lib.optionals cfg.prune.dryRun [ "--dry-run" ]
+    ++ lib.optionals cfg.prune.skipArchivedSessions [ "--skip-archived-sessions" ]
+  );
   runAgent = pkgs.writeShellScript "codex-session-archive-agent" ''
     set -euo pipefail
-    exec ${cfg.package}/bin/archive-agent watch \
-      --server ${lib.escapeShellArg cfg.serverUrl} \
-      --token-file ${lib.escapeShellArg cfg.ingestTokenFile} \
-      --codex-home ${lib.escapeShellArg cfg.codexHome} \
-      --max-lines-per-batch ${toString cfg.maxLinesPerBatch} \
-      --request-timeout-seconds ${toString cfg.requestTimeoutSeconds} \
-      --interval-seconds ${toString cfg.intervalSeconds} \
-      --quiet
+    exec ${cfg.package}/bin/archive-agent ${runAgentArgs}
+  '';
+  runPrune = pkgs.writeShellScript "codex-session-archive-prune" ''
+    set -euo pipefail
+    exec ${cfg.package}/bin/archive-agent ${runPruneArgs}
   '';
 in
 {
@@ -66,6 +97,34 @@ in
       default = 600;
       description = "HTTP request timeout for cursor and ingest requests.";
     };
+
+    prune = {
+      enable = lib.mkEnableOption "scheduled pruning of fully archived local Codex rollout files";
+
+      minAgeDays = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 30;
+        description = "Minimum file age in days before pruning a fully archived rollout file.";
+      };
+
+      intervalSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 86400;
+        description = "How often to run prune.";
+      };
+
+      dryRun = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether scheduled prune should log candidates without deleting them.";
+      };
+
+      skipArchivedSessions = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Skip files under archived_sessions when pruning.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable (
@@ -92,6 +151,19 @@ in
             ProcessType = "Background";
           };
         };
+
+        launchd.agents.codex-session-archive-prune = lib.mkIf cfg.prune.enable {
+          enable = true;
+          config = {
+            ProgramArguments = [ (toString runPrune) ];
+            RunAtLoad = true;
+            StartInterval = cfg.prune.intervalSeconds;
+            StandardOutPath = "${logDir}/prune.log";
+            StandardErrorPath = "${logDir}/prune-error.log";
+            WorkingDirectory = config.home.homeDirectory;
+            ProcessType = "Background";
+          };
+        };
       })
 
       (lib.mkIf pkgs.stdenv.hostPlatform.isLinux {
@@ -107,6 +179,28 @@ in
             WorkingDirectory = config.home.homeDirectory;
           };
           Install.WantedBy = [ "default.target" ];
+        };
+
+        systemd.user.services.codex-session-archive-prune = lib.mkIf cfg.prune.enable {
+          Unit = {
+            Description = "Codex Session Archive Prune";
+            After = [ "network-online.target" ];
+          };
+          Service = {
+            ExecStart = toString runPrune;
+            Type = "oneshot";
+            WorkingDirectory = config.home.homeDirectory;
+          };
+        };
+
+        systemd.user.timers.codex-session-archive-prune = lib.mkIf cfg.prune.enable {
+          Unit.Description = "Run Codex Session Archive prune";
+          Timer = {
+            OnBootSec = "5m";
+            OnUnitActiveSec = "${toString cfg.prune.intervalSeconds}s";
+            Unit = "codex-session-archive-prune.service";
+          };
+          Install.WantedBy = [ "timers.target" ];
         };
       })
     ]

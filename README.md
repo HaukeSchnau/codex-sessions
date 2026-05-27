@@ -114,6 +114,20 @@ cargo run -p archive-agent -- watch \
 
 The agent asks the server for per-file cursors before each scan, skips already-imported files, and uploads only new complete JSONL records for append-only files. Use `--json` for agent-readable progress events or `--quiet` for silence.
 
+Prune local rollout files that are already fully archived on the server:
+
+```sh
+cargo run -p archive-agent -- prune \
+  --server http://127.0.0.1:8787 \
+  --token-file ./ingest-token \
+  --codex-home ~/.codex \
+  --min-age-days 30 \
+  --dry-run \
+  --json
+```
+
+`prune` only deletes rollout files when the server confirms the exact file hash and byte cursor have already been imported. By default it considers both `sessions/` and `archived_sessions/`; pass `--skip-archived-sessions` to keep local archived rollouts around.
+
 ## HTTP
 
 - `POST /v1/ingest/batch`
