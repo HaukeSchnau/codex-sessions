@@ -4,19 +4,19 @@ use std::time::Duration;
 
 use anyhow::Context;
 use archive_core::{
-    chunk_rollout_lines, parse_thread_name_update, AgentBatch, Chunk, FileCursor, FileKind,
-    IngestResponse, MachineSyncStatus, RolloutLine, StatusCount, SyncContentCounts, SyncFileCounts,
+    AgentBatch, Chunk, FileCursor, FileKind, IngestResponse, MachineSyncStatus, RolloutLine,
+    StatusCount, SyncContentCounts, SyncFileCounts, chunk_rollout_lines, parse_thread_name_update,
 };
 use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use reqwest::multipart::{Form as MultipartForm, Part};
 use reqwest::Client;
+use reqwest::multipart::{Form as MultipartForm, Part};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tower_http::cors::CorsLayer;
@@ -811,7 +811,18 @@ async fn fetch_threads(
         LEFT JOIN LATERAL (
           SELECT c.text FROM chunks c
           WHERE c.thread_id = t.thread_id
-          ORDER BY c.start_line ASC LIMIT 1
+          ORDER BY
+            CASE
+              WHEN c.chunk_kind IN ('assistant_message', 'user_message')
+                   AND c.text NOT LIKE '# AGENTS.md instructions%'
+                   AND c.text NOT LIKE '<skill>%'
+                   AND length(c.text) <= 2000 THEN 0
+              WHEN c.chunk_kind = 'lifecycle' THEN 1
+              WHEN c.chunk_kind = 'tool' THEN 3
+              ELSE 2
+            END,
+            c.start_line ASC
+          LIMIT 1
         ) preview ON TRUE
         LEFT JOIN rollout_lines rl ON rl.thread_id = t.thread_id
         LEFT JOIN rollout_files rf ON rf.id = rl.file_id
@@ -1244,11 +1255,7 @@ fn render_scope_options(selected: SearchScope) -> String {
 }
 
 fn selected_attr(selected: bool) -> &'static str {
-    if selected {
-        " selected"
-    } else {
-        ""
-    }
+    if selected { " selected" } else { "" }
 }
 
 fn display_str(value: Option<&str>) -> &str {
@@ -1872,6 +1879,7 @@ async fn keyword_search(
     scope: SearchScope,
     limit: i64,
 ) -> Result<Vec<SearchResult>, ApiError> {
+    let fetch_limit = expanded_search_fetch_limit(limit);
     let rows = sqlx::query(
         r#"
         SELECT id, thread_id, turn_id, chunk_kind, role, text, start_line, end_line,
@@ -1885,10 +1893,13 @@ async fn keyword_search(
     )
     .bind(query)
     .bind(search_scope_name(scope))
-    .bind(limit)
+    .bind(fetch_limit)
     .fetch_all(db)
     .await?;
-    Ok(rows.into_iter().map(search_result_from_row).collect())
+    Ok(rerank_search_results(
+        rows.into_iter().map(search_result_from_row).collect(),
+        limit,
+    ))
 }
 
 async fn semantic_search(
@@ -1897,6 +1908,7 @@ async fn semantic_search(
     scope: SearchScope,
     limit: i64,
 ) -> Result<Vec<SearchResult>, ApiError> {
+    let fetch_limit = expanded_search_fetch_limit(limit);
     let embedding = embed_text(state, query).await?;
     let vector = vector_literal(&embedding);
     let rows = sqlx::query(
@@ -1912,10 +1924,13 @@ async fn semantic_search(
     )
     .bind(vector)
     .bind(search_scope_name(scope))
-    .bind(limit)
+    .bind(fetch_limit)
     .fetch_all(&state.db)
     .await?;
-    Ok(rows.into_iter().map(search_result_from_row).collect())
+    Ok(rerank_search_results(
+        rows.into_iter().map(search_result_from_row).collect(),
+        limit,
+    ))
 }
 
 async fn hybrid_search(
@@ -1927,6 +1942,7 @@ async fn hybrid_search(
     if state.openai_api_key.is_empty() {
         return keyword_search(&state.db, query, scope, limit).await;
     }
+    let fetch_limit = expanded_search_fetch_limit(limit);
     let embedding = embed_text(state, query).await?;
     let vector = vector_literal(&embedding);
     let rows = sqlx::query(
@@ -1964,10 +1980,13 @@ async fn hybrid_search(
     .bind(query)
     .bind(vector)
     .bind(search_scope_name(scope))
-    .bind(limit)
+    .bind(fetch_limit)
     .fetch_all(&state.db)
     .await?;
-    Ok(rows.into_iter().map(search_result_from_row).collect())
+    Ok(rerank_search_results(
+        rows.into_iter().map(search_result_from_row).collect(),
+        limit,
+    ))
 }
 
 async fn embed_text(state: &AppState, text: &str) -> Result<Vec<f32>, ApiError> {
@@ -2646,6 +2665,58 @@ fn search_scope_name(scope: SearchScope) -> &'static str {
     }
 }
 
+fn expanded_search_fetch_limit(limit: i64) -> i64 {
+    (limit.max(1) * 5).clamp(20, 500)
+}
+
+fn search_quality_multiplier(result: &SearchResult) -> f64 {
+    let mut multiplier: f64 = match result.chunk_kind.as_str() {
+        "assistant_message" | "user_message" => 1.08,
+        "lifecycle" => 0.96,
+        "tool" => 0.62,
+        _ => 1.0,
+    };
+
+    let text = result.text.as_str();
+    if text.len() > 8_000 {
+        multiplier *= 0.45;
+    } else if text.len() > 4_000 {
+        multiplier *= 0.65;
+    } else if text.len() > 1_500 {
+        multiplier *= 0.82;
+    }
+
+    if text.starts_with("function_call_output ") {
+        multiplier *= 0.72;
+    }
+    if text.starts_with("custom_tool_call apply_patch") {
+        multiplier *= 0.5;
+    }
+    if text.contains("*** Begin Patch") {
+        multiplier *= 0.75;
+    }
+    if text.starts_with("# AGENTS.md instructions") || text.starts_with("<skill>") {
+        multiplier *= 0.6;
+    }
+
+    multiplier.clamp(0.15, 1.25)
+}
+
+fn rerank_search_results(mut results: Vec<SearchResult>, limit: i64) -> Vec<SearchResult> {
+    for result in &mut results {
+        result.score *= search_quality_multiplier(result);
+    }
+    results.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.chunk_id.cmp(&left.chunk_id))
+    });
+    results.truncate(limit.max(0) as usize);
+    results
+}
+
 fn collapse_results(results: Vec<SearchResult>, limit: i64) -> Vec<SearchResult> {
     let mut seen = HashSet::new();
     let mut collapsed = Vec::new();
@@ -2753,11 +2824,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     cookie_header.split(';').find_map(|part| {
         let (name, value) = part.trim().split_once('=')?;
-        if name == key {
-            Some(value)
-        } else {
-            None
-        }
+        if name == key { Some(value) } else { None }
     })
 }
 
@@ -2918,6 +2985,87 @@ mod tests {
     #[test]
     fn vector_literal_uses_pgvector_format() {
         assert_eq!(vector_literal(&[0.1, -0.2]), "[0.1,-0.2]");
+    }
+
+    #[test]
+    fn expanded_search_fetch_limit_caps_growth() {
+        assert_eq!(expanded_search_fetch_limit(1), 20);
+        assert_eq!(expanded_search_fetch_limit(20), 100);
+        assert_eq!(expanded_search_fetch_limit(200), 500);
+    }
+
+    #[test]
+    fn search_quality_penalizes_large_tool_patch_output() {
+        let patchy_tool = SearchResult {
+            chunk_id: 1,
+            thread_id: "thread".to_string(),
+            turn_id: None,
+            chunk_kind: "tool".to_string(),
+            role: None,
+            text: format!(
+                "custom_tool_call apply_patch\n*** Begin Patch\n{}",
+                "x".repeat(9000)
+            ),
+            score: 1.0,
+            citation: Citation {
+                thread_id: "thread".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        let assistant = SearchResult {
+            chunk_id: 2,
+            thread_id: "thread".to_string(),
+            turn_id: None,
+            chunk_kind: "assistant_message".to_string(),
+            role: Some("assistant".to_string()),
+            text: "Found the ingestion bug in the batch handoff".to_string(),
+            score: 1.0,
+            citation: Citation {
+                thread_id: "thread".to_string(),
+                start_line: 2,
+                end_line: 2,
+            },
+        };
+
+        assert!(search_quality_multiplier(&patchy_tool) < 0.2);
+        assert!(search_quality_multiplier(&assistant) > 1.0);
+    }
+
+    #[test]
+    fn rerank_search_results_prefers_concise_conversation_chunks() {
+        let patchy_tool = SearchResult {
+            chunk_id: 1,
+            thread_id: "thread-a".to_string(),
+            turn_id: None,
+            chunk_kind: "tool".to_string(),
+            role: None,
+            text: format!("function_call_output call_123\n{}", "x".repeat(5000)),
+            score: 1.0,
+            citation: Citation {
+                thread_id: "thread-a".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        let assistant = SearchResult {
+            chunk_id: 2,
+            thread_id: "thread-b".to_string(),
+            turn_id: None,
+            chunk_kind: "assistant_message".to_string(),
+            role: Some("assistant".to_string()),
+            text: "We fixed the completeness issue by persisting later rollout batches."
+                .to_string(),
+            score: 0.9,
+            citation: Citation {
+                thread_id: "thread-b".to_string(),
+                start_line: 2,
+                end_line: 2,
+            },
+        };
+
+        let reranked = rerank_search_results(vec![patchy_tool, assistant.clone()], 2);
+        assert_eq!(reranked.first().unwrap().chunk_id, assistant.chunk_id);
     }
 
     #[test]
