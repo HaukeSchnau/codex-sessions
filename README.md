@@ -73,11 +73,16 @@ For local agent runs, prefer storing the ingest token in a file and passing
 Optional:
 
 ```sh
+export OPENAI_EMBEDDING_BACKEND=batch
 export OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+export OPENAI_EMBEDDING_BATCH_MAX_REQUESTS=512
+export OPENAI_EMBEDDING_BATCH_POLL_SECONDS=30
 export EMBEDDING_DIMENSIONS=1536
 export ARCHIVE_MAX_INGEST_BODY_BYTES=67108864
 export BIND_ADDR=127.0.0.1:8787
 ```
+
+Chunk embeddings use the OpenAI Batch API by default for both fresh ingests and backlog/reindex work. Search-time query embeddings remain synchronous so semantic and hybrid searches still answer immediately.
 
 Run:
 

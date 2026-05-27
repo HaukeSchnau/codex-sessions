@@ -108,10 +108,31 @@ in
       description = "OpenAI embedding model used for semantic search.";
     };
 
+    embeddingBackend = lib.mkOption {
+      type = lib.types.enum [
+        "batch"
+        "sync"
+      ];
+      default = "batch";
+      description = "Backend used for chunk embeddings. Query-time search embeddings remain synchronous.";
+    };
+
     embeddingDimensions = lib.mkOption {
       type = lib.types.ints.positive;
       default = 1536;
       description = "Embedding vector dimensions expected by the database schema.";
+    };
+
+    embeddingBatchMaxRequests = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 512;
+      description = "Maximum chunk embedding requests per OpenAI Batch submission.";
+    };
+
+    embeddingBatchPollSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 30;
+      description = "Polling interval for OpenAI Batch status and result processing.";
     };
 
     maxIngestBodyBytes = lib.mkOption {
@@ -214,6 +235,9 @@ in
         BIND_ADDR = cfg.bindAddr;
         DATABASE_URL = cfg.database.url;
         EMBEDDING_DIMENSIONS = toString cfg.embeddingDimensions;
+        OPENAI_EMBEDDING_BACKEND = cfg.embeddingBackend;
+        OPENAI_EMBEDDING_BATCH_MAX_REQUESTS = toString cfg.embeddingBatchMaxRequests;
+        OPENAI_EMBEDDING_BATCH_POLL_SECONDS = toString cfg.embeddingBatchPollSeconds;
         OPENAI_EMBEDDING_MODEL = cfg.embeddingModel;
         RUST_LOG = cfg.logLevel;
         SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";

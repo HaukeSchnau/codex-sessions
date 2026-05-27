@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,8 +29,11 @@ struct AppState {
     ingest_token: String,
     read_token: String,
     openai_api_key: String,
+    embedding_backend: EmbeddingBackend,
     embedding_model: String,
     embedding_dimensions: i32,
+    embedding_batch_max_requests: i64,
+    embedding_batch_poll_seconds: u64,
     http: Client,
 }
 
@@ -39,10 +43,19 @@ struct Config {
     ingest_token: String,
     read_token: String,
     openai_api_key: String,
+    embedding_backend: EmbeddingBackend,
     embedding_model: String,
     embedding_dimensions: i32,
+    embedding_batch_max_requests: i64,
+    embedding_batch_poll_seconds: u64,
     bind_addr: SocketAddr,
     max_ingest_body_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingBackend {
+    Sync,
+    Batch,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -192,6 +205,65 @@ enum RawFormat {
     Jsonl,
 }
 
+#[derive(Debug)]
+struct BatchEmbeddingJob {
+    chunk_id: i64,
+    text: String,
+    attempts: i32,
+}
+
+#[derive(Debug)]
+struct EmbeddingBatchRow {
+    id: i64,
+    openai_batch_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiBatchRequestLine<'a> {
+    custom_id: String,
+    method: &'static str,
+    url: &'static str,
+    body: OpenAiEmbeddingBody<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiEmbeddingBody<'a> {
+    model: &'a str,
+    input: &'a str,
+    dimensions: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiFileObject {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiBatchObject {
+    id: String,
+    status: String,
+    output_file_id: Option<String>,
+    error_file_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiBatchResultLine {
+    custom_id: String,
+    response: Option<OpenAiBatchResultResponse>,
+    error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiBatchResultResponse {
+    status_code: u16,
+    body: Value,
+}
+
+enum BatchEmbeddingOutcome {
+    Success(Vec<f32>),
+    Failure(String),
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -214,10 +286,13 @@ async fn main() -> anyhow::Result<()> {
         ingest_token: config.ingest_token,
         read_token: config.read_token,
         openai_api_key: config.openai_api_key,
+        embedding_backend: config.embedding_backend,
         embedding_model: config.embedding_model,
         embedding_dimensions: config.embedding_dimensions,
+        embedding_batch_max_requests: config.embedding_batch_max_requests,
+        embedding_batch_poll_seconds: config.embedding_batch_poll_seconds,
         http: Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .build()
             .context("build HTTP client")?,
     };
@@ -257,12 +332,23 @@ impl Config {
             read_token: std::env::var("ARCHIVE_READ_TOKEN")
                 .context("ARCHIVE_READ_TOKEN is required")?,
             openai_api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            embedding_backend: EmbeddingBackend::from_env()?,
             embedding_model: std::env::var("OPENAI_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "text-embedding-3-small".to_string()),
             embedding_dimensions: std::env::var("EMBEDDING_DIMENSIONS")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1536),
+            embedding_batch_max_requests: std::env::var("OPENAI_EMBEDDING_BATCH_MAX_REQUESTS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(512)
+                .max(1),
+            embedding_batch_poll_seconds: std::env::var("OPENAI_EMBEDDING_BATCH_POLL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30)
+                .max(1),
             bind_addr: std::env::var("BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:8787".to_string())
                 .parse()
@@ -272,6 +358,22 @@ impl Config {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(64 * 1024 * 1024),
         })
+    }
+}
+
+impl EmbeddingBackend {
+    fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("OPENAI_EMBEDDING_BACKEND")
+            .unwrap_or_else(|_| "batch".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "sync" => Ok(Self::Sync),
+            "batch" => Ok(Self::Batch),
+            other => {
+                anyhow::bail!("OPENAI_EMBEDDING_BACKEND must be 'sync' or 'batch', got '{other}'")
+            }
+        }
     }
 }
 
@@ -1259,16 +1361,27 @@ fn spawn_embedding_worker(state: AppState) {
             info!("OPENAI_API_KEY is not set; embedding worker is idle");
             return;
         }
+        let poll_seconds = match state.embedding_backend {
+            EmbeddingBackend::Sync => 5,
+            EmbeddingBackend::Batch => state.embedding_batch_poll_seconds,
+        };
         loop {
-            if let Err(err) = run_embedding_once(&state).await {
+            if let Err(err) = run_embedding_cycle(&state).await {
                 error!(error = %err, "embedding worker failed");
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
         }
     });
 }
 
-async fn run_embedding_once(state: &AppState) -> Result<(), ApiError> {
+async fn run_embedding_cycle(state: &AppState) -> Result<(), ApiError> {
+    match state.embedding_backend {
+        EmbeddingBackend::Sync => run_sync_embedding_once(state).await,
+        EmbeddingBackend::Batch => run_batch_embedding_once(state).await,
+    }
+}
+
+async fn run_sync_embedding_once(state: &AppState) -> Result<(), ApiError> {
     let rows = sqlx::query(
         r#"
         UPDATE embedding_jobs
@@ -1323,6 +1436,465 @@ async fn run_embedding_once(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
+async fn run_batch_embedding_once(state: &AppState) -> Result<(), ApiError> {
+    poll_openai_batches(state).await?;
+    submit_openai_embedding_batch(state).await?;
+    Ok(())
+}
+
+async fn submit_openai_embedding_batch(state: &AppState) -> Result<(), ApiError> {
+    let jobs = claim_batch_embedding_jobs(state).await?;
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    let mut lines = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        lines.push(
+            serde_json::to_string(&OpenAiBatchRequestLine {
+                custom_id: batch_custom_id(job.chunk_id, job.attempts),
+                method: "POST",
+                url: "/v1/embeddings",
+                body: OpenAiEmbeddingBody {
+                    model: &state.embedding_model,
+                    input: &job.text,
+                    dimensions: state.embedding_dimensions,
+                },
+            })
+            .map_err(|err| ApiError::Upstream(err.to_string()))?,
+        );
+    }
+    let payload = lines.join("\n") + "\n";
+
+    match upload_openai_batch_file(state, payload.into_bytes()).await {
+        Ok(file_id) => match create_openai_batch(state, &file_id).await {
+            Ok(batch) => {
+                let batch_row_id =
+                    insert_openai_batch(state, &batch, &file_id, jobs.len() as i32).await?;
+                assign_jobs_to_batch(state, batch_row_id, &jobs).await?;
+            }
+            Err(err) => {
+                mark_batch_submission_failed(
+                    &state.db,
+                    &jobs,
+                    &format!("create OpenAI batch: {err}"),
+                )
+                .await?;
+                return Err(err);
+            }
+        },
+        Err(err) => {
+            mark_batch_submission_failed(&state.db, &jobs, &format!("upload batch input: {err}"))
+                .await?;
+            return Err(err);
+        }
+    }
+
+    Ok(())
+}
+
+async fn claim_batch_embedding_jobs(state: &AppState) -> Result<Vec<BatchEmbeddingJob>, ApiError> {
+    let rows = sqlx::query(
+        r#"
+        WITH picked AS (
+          SELECT ej.chunk_id
+          FROM embedding_jobs ej
+          WHERE ej.status IN ('pending', 'failed')
+            AND ej.attempts < 5
+            AND ej.batch_id IS NULL
+          ORDER BY ej.created_at DESC, ej.chunk_id ASC
+          LIMIT $1
+        )
+        UPDATE embedding_jobs ej
+        SET status = 'running',
+            locked_at = now(),
+            attempts = attempts + 1,
+            updated_at = now()
+        FROM picked, chunks c
+        WHERE ej.chunk_id = picked.chunk_id
+          AND c.id = picked.chunk_id
+        RETURNING ej.chunk_id, c.text, ej.attempts
+        "#,
+    )
+    .bind(state.embedding_batch_max_requests)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| BatchEmbeddingJob {
+            chunk_id: row.get("chunk_id"),
+            text: row.get("text"),
+            attempts: row.get("attempts"),
+        })
+        .collect())
+}
+
+async fn upload_openai_batch_file(state: &AppState, payload: Vec<u8>) -> Result<String, ApiError> {
+    let response = state
+        .http
+        .post("https://api.openai.com/v1/files")
+        .bearer_auth(&state.openai_api_key)
+        .multipart(
+            Form::new().text("purpose", "batch").part(
+                "file",
+                Part::bytes(payload)
+                    .file_name("archive-embeddings.jsonl")
+                    .mime_str("application/jsonl")
+                    .map_err(|err| ApiError::Upstream(err.to_string()))?,
+            ),
+        )
+        .send()
+        .await
+        .map_err(|err| ApiError::Upstream(err.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::Upstream(format!(
+            "OpenAI file upload failed: {}",
+            response.status()
+        )));
+    }
+    let file: OpenAiFileObject = response
+        .json()
+        .await
+        .map_err(|err| ApiError::Upstream(err.to_string()))?;
+    Ok(file.id)
+}
+
+async fn create_openai_batch(
+    state: &AppState,
+    input_file_id: &str,
+) -> Result<OpenAiBatchObject, ApiError> {
+    let response = state
+        .http
+        .post("https://api.openai.com/v1/batches")
+        .bearer_auth(&state.openai_api_key)
+        .json(&json!({
+            "input_file_id": input_file_id,
+            "endpoint": "/v1/embeddings",
+            "completion_window": "24h"
+        }))
+        .send()
+        .await
+        .map_err(|err| ApiError::Upstream(err.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::Upstream(format!(
+            "OpenAI batch create failed: {}",
+            response.status()
+        )));
+    }
+    response
+        .json()
+        .await
+        .map_err(|err| ApiError::Upstream(err.to_string()))
+}
+
+async fn insert_openai_batch(
+    state: &AppState,
+    batch: &OpenAiBatchObject,
+    input_file_id: &str,
+    request_count: i32,
+) -> Result<i64, ApiError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO embedding_batches (
+          openai_batch_id,
+          openai_input_file_id,
+          openai_output_file_id,
+          openai_error_file_id,
+          status,
+          request_count,
+          submitted_at,
+          updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, now(), now())
+        RETURNING id
+        "#,
+    )
+    .bind(&batch.id)
+    .bind(input_file_id)
+    .bind(&batch.output_file_id)
+    .bind(&batch.error_file_id)
+    .bind(&batch.status)
+    .bind(request_count)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(row.get("id"))
+}
+
+async fn assign_jobs_to_batch(
+    state: &AppState,
+    batch_id: i64,
+    jobs: &[BatchEmbeddingJob],
+) -> Result<(), ApiError> {
+    for job in jobs {
+        sqlx::query(
+            "UPDATE embedding_jobs SET status = 'submitted', batch_id = $2, batch_custom_id = $3, updated_at = now() WHERE chunk_id = $1",
+        )
+        .bind(job.chunk_id)
+        .bind(batch_id)
+        .bind(batch_custom_id(job.chunk_id, job.attempts))
+        .execute(&state.db)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn mark_batch_submission_failed(
+    db: &PgPool,
+    jobs: &[BatchEmbeddingJob],
+    message: &str,
+) -> Result<(), ApiError> {
+    for job in jobs {
+        sqlx::query(
+            "UPDATE embedding_jobs SET status = 'failed', batch_id = NULL, batch_custom_id = NULL, last_error = $2, updated_at = now() WHERE chunk_id = $1",
+        )
+        .bind(job.chunk_id)
+        .bind(message)
+        .execute(db)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn poll_openai_batches(state: &AppState) -> Result<(), ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, openai_batch_id, openai_output_file_id, openai_error_file_id, status
+        FROM embedding_batches
+        WHERE results_applied_at IS NULL
+        ORDER BY submitted_at ASC
+        LIMIT 4
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    for row in rows {
+        let batch = EmbeddingBatchRow {
+            id: row.get("id"),
+            openai_batch_id: row.get("openai_batch_id"),
+        };
+        let remote = retrieve_openai_batch(state, &batch.openai_batch_id).await?;
+        update_openai_batch_status(&state.db, batch.id, &remote).await?;
+        match remote.status.as_str() {
+            "completed" => apply_openai_batch_results(state, batch.id, &remote).await?,
+            "failed" | "expired" | "cancelled" => {
+                fail_openai_batch_jobs(
+                    &state.db,
+                    batch.id,
+                    &format!("OpenAI batch {}", remote.status),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn retrieve_openai_batch(
+    state: &AppState,
+    batch_id: &str,
+) -> Result<OpenAiBatchObject, ApiError> {
+    let response = state
+        .http
+        .get(format!("https://api.openai.com/v1/batches/{batch_id}"))
+        .bearer_auth(&state.openai_api_key)
+        .send()
+        .await
+        .map_err(|err| ApiError::Upstream(err.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::Upstream(format!(
+            "OpenAI batch retrieve failed: {}",
+            response.status()
+        )));
+    }
+    response
+        .json()
+        .await
+        .map_err(|err| ApiError::Upstream(err.to_string()))
+}
+
+async fn update_openai_batch_status(
+    db: &PgPool,
+    batch_row_id: i64,
+    batch: &OpenAiBatchObject,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE embedding_batches
+        SET status = $2,
+            openai_output_file_id = $3,
+            openai_error_file_id = $4,
+            completed_at = CASE
+              WHEN $2 IN ('completed', 'failed', 'expired', 'cancelled') THEN coalesce(completed_at, now())
+              ELSE completed_at
+            END,
+            updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(batch_row_id)
+    .bind(&batch.status)
+    .bind(&batch.output_file_id)
+    .bind(&batch.error_file_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn apply_openai_batch_results(
+    state: &AppState,
+    batch_row_id: i64,
+    batch: &OpenAiBatchObject,
+) -> Result<(), ApiError> {
+    let mut outcomes = HashMap::new();
+    let output_file_id = if let Some(file_id) = batch.output_file_id.clone() {
+        Some(file_id)
+    } else {
+        batch_row_for_output(batch_row_id, &state.db).await?
+    };
+    if let Some(output_file_id) = output_file_id.as_deref() {
+        for line in fetch_openai_batch_file_lines(state, output_file_id).await? {
+            outcomes.insert(
+                parse_batch_chunk_id(&line.custom_id)?,
+                batch_line_outcome(line)?,
+            );
+        }
+    }
+    let error_file_id = if let Some(file_id) = batch.error_file_id.clone() {
+        Some(file_id)
+    } else {
+        batch_row_for_error(batch_row_id, &state.db).await?
+    };
+    if let Some(error_file_id) = error_file_id.as_deref() {
+        for line in fetch_openai_batch_file_lines(state, error_file_id).await? {
+            outcomes.insert(
+                parse_batch_chunk_id(&line.custom_id)?,
+                batch_line_outcome(line)?,
+            );
+        }
+    }
+
+    let jobs = sqlx::query(
+        "SELECT chunk_id FROM embedding_jobs WHERE batch_id = $1 AND status = 'submitted'",
+    )
+    .bind(batch_row_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    for row in jobs {
+        let chunk_id: i64 = row.get("chunk_id");
+        match outcomes.remove(&chunk_id) {
+            Some(BatchEmbeddingOutcome::Success(embedding)) => {
+                sqlx::query(
+                    "UPDATE chunks SET embedding = $2::vector, embedding_model = $3 WHERE id = $1",
+                )
+                .bind(chunk_id)
+                .bind(vector_literal(&embedding))
+                .bind(&state.embedding_model)
+                .execute(&state.db)
+                .await?;
+                sqlx::query(
+                    "UPDATE embedding_jobs SET status = 'done', completed_at = now(), updated_at = now(), last_error = NULL WHERE chunk_id = $1",
+                )
+                .bind(chunk_id)
+                .execute(&state.db)
+                .await?;
+            }
+            Some(BatchEmbeddingOutcome::Failure(message)) => {
+                sqlx::query(
+                    "UPDATE embedding_jobs SET status = 'failed', batch_id = NULL, batch_custom_id = NULL, last_error = $2, updated_at = now() WHERE chunk_id = $1",
+                )
+                .bind(chunk_id)
+                .bind(message)
+                .execute(&state.db)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE embedding_jobs SET status = 'failed', batch_id = NULL, batch_custom_id = NULL, last_error = 'OpenAI batch completed without a result row', updated_at = now() WHERE chunk_id = $1",
+                )
+                .bind(chunk_id)
+                .execute(&state.db)
+                .await?;
+            }
+        }
+    }
+
+    sqlx::query(
+        "UPDATE embedding_batches SET results_applied_at = now(), updated_at = now() WHERE id = $1",
+    )
+    .bind(batch_row_id)
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
+async fn batch_row_for_output(db_batch_id: i64, db: &PgPool) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query("SELECT openai_output_file_id FROM embedding_batches WHERE id = $1")
+        .bind(db_batch_id)
+        .fetch_one(db)
+        .await?;
+    Ok(row.get("openai_output_file_id"))
+}
+
+async fn batch_row_for_error(db_batch_id: i64, db: &PgPool) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query("SELECT openai_error_file_id FROM embedding_batches WHERE id = $1")
+        .bind(db_batch_id)
+        .fetch_one(db)
+        .await?;
+    Ok(row.get("openai_error_file_id"))
+}
+
+async fn fetch_openai_batch_file_lines(
+    state: &AppState,
+    file_id: &str,
+) -> Result<Vec<OpenAiBatchResultLine>, ApiError> {
+    let response = state
+        .http
+        .get(format!("https://api.openai.com/v1/files/{file_id}/content"))
+        .bearer_auth(&state.openai_api_key)
+        .send()
+        .await
+        .map_err(|err| ApiError::Upstream(err.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::Upstream(format!(
+            "OpenAI file download failed: {}",
+            response.status()
+        )));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|err| ApiError::Upstream(err.to_string()))?;
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(|err| ApiError::Upstream(err.to_string())))
+        .collect()
+}
+
+async fn fail_openai_batch_jobs(
+    db: &PgPool,
+    batch_row_id: i64,
+    message: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE embedding_jobs SET status = 'failed', batch_id = NULL, batch_custom_id = NULL, last_error = $2, updated_at = now() WHERE batch_id = $1 AND status IN ('submitted', 'running')",
+    )
+    .bind(batch_row_id)
+    .bind(message)
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "UPDATE embedding_batches SET results_applied_at = now(), updated_at = now(), last_error = $2 WHERE id = $1",
+    )
+    .bind(batch_row_id)
+    .bind(message)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 async fn prioritize_thread_embeddings(db: &PgPool, thread_id: &str) -> Result<u64, ApiError> {
     let result = sqlx::query(
         r#"
@@ -1362,6 +1934,52 @@ fn vector_literal(values: &[f32]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{inner}]")
+}
+
+fn batch_custom_id(chunk_id: i64, attempts: i32) -> String {
+    format!("chunk:{chunk_id}:attempt:{attempts}")
+}
+
+fn parse_batch_chunk_id(custom_id: &str) -> Result<i64, ApiError> {
+    let mut parts = custom_id.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("chunk"), Some(chunk_id), Some("attempt"), Some(_attempt)) => chunk_id
+            .parse()
+            .map_err(|_| ApiError::Upstream(format!("invalid batch custom_id: {custom_id}"))),
+        _ => Err(ApiError::Upstream(format!(
+            "invalid batch custom_id: {custom_id}"
+        ))),
+    }
+}
+
+fn batch_line_outcome(line: OpenAiBatchResultLine) -> Result<BatchEmbeddingOutcome, ApiError> {
+    if let Some(response) = line.response {
+        if response.status_code == 200 {
+            let embedding = response
+                .body
+                .pointer("/data/0/embedding")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    ApiError::Upstream(format!(
+                        "missing embedding in batch response for {}",
+                        line.custom_id
+                    ))
+                })?
+                .iter()
+                .filter_map(|value| value.as_f64().map(|number| number as f32))
+                .collect::<Vec<_>>();
+            return Ok(BatchEmbeddingOutcome::Success(embedding));
+        }
+        return Ok(BatchEmbeddingOutcome::Failure(format!(
+            "OpenAI batch request failed with {}: {}",
+            response.status_code, response.body
+        )));
+    }
+    Ok(BatchEmbeddingOutcome::Failure(
+        line.error
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "OpenAI batch request failed without an error body".to_string()),
+    ))
 }
 
 fn search_scope_name(scope: SearchScope) -> &'static str {
@@ -1619,6 +2237,43 @@ mod tests {
                 .unwrap_or_else(|_| "text-embedding-3-small".to_string()),
             "text-embedding-3-small"
         );
+    }
+
+    #[test]
+    fn embedding_backend_defaults_to_batch() {
+        assert_eq!(
+            std::env::var("OPENAI_EMBEDDING_BACKEND").unwrap_or_else(|_| "batch".to_string()),
+            "batch"
+        );
+    }
+
+    #[test]
+    fn batch_custom_id_round_trips_chunk_id() {
+        let custom_id = batch_custom_id(42, 3);
+        assert_eq!(custom_id, "chunk:42:attempt:3");
+        assert_eq!(parse_batch_chunk_id(&custom_id).unwrap(), 42);
+    }
+
+    #[test]
+    fn batch_line_outcome_extracts_embedding() {
+        let line: OpenAiBatchResultLine = serde_json::from_value(json!({
+            "custom_id": "chunk:7:attempt:1",
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "data": [{ "embedding": [0.1, -0.2] }]
+                }
+            },
+            "error": null
+        }))
+        .unwrap();
+
+        match batch_line_outcome(line).unwrap() {
+            BatchEmbeddingOutcome::Success(embedding) => {
+                assert_eq!(embedding, vec![0.1_f32, -0.2_f32]);
+            }
+            BatchEmbeddingOutcome::Failure(message) => panic!("unexpected failure: {message}"),
+        }
     }
 
     #[test]
