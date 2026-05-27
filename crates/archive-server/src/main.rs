@@ -580,7 +580,8 @@ async fn sync_status(
     Query(params): Query<SyncStatusParams>,
 ) -> Result<Json<Vec<MachineSyncStatus>>, ApiError> {
     require_token(&headers, &state.read_token)?;
-    let machines = if let Some(machine_id) = params.machine_id {
+    let requested_machine = params.machine_id.clone();
+    let machines = if let Some(machine_id) = requested_machine.as_ref() {
         if let Some(machine) = sqlx::query(
             "SELECT machine_id, hostname, installation_id, first_seen_at, last_seen_at FROM machines WHERE machine_id = $1",
         )
@@ -603,7 +604,11 @@ async fn sync_status(
     let mut statuses = Vec::new();
     for machine in machines {
         let machine_id: String = machine.get("machine_id");
-        statuses.push(machine_sync_status(&state.db, &machine, &machine_id).await?);
+        if requested_machine.is_some() {
+            statuses.push(machine_sync_status(&state.db, &machine, &machine_id).await?);
+        } else {
+            statuses.push(machine_sync_overview(&state.db, &machine, &machine_id).await?);
+        }
     }
     Ok(Json(statuses))
 }
@@ -1770,21 +1775,7 @@ async fn machine_sync_status(
     machine: &sqlx::postgres::PgRow,
     machine_id: &str,
 ) -> Result<MachineSyncStatus, ApiError> {
-    let files_fut = sqlx::query(
-        r#"
-        SELECT
-          count(*) FILTER (WHERE kind = 'active_rollout') AS active_rollout,
-          count(*) FILTER (WHERE kind = 'archived_rollout') AS archived_rollout,
-          count(*) FILTER (WHERE kind = 'session_index') AS session_index,
-          count(*) AS total,
-          count(*) FILTER (WHERE relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
-                            OR relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today
-        FROM rollout_files
-        WHERE machine_id = $1
-        "#,
-    )
-    .bind(machine_id)
-    .fetch_one(db);
+    let files_fut = file_counts(db, machine_id);
     let line_counts_fut = sqlx::query(
         r#"
         SELECT
@@ -1861,6 +1852,56 @@ async fn machine_sync_status(
         embeddings,
         ingest_errors,
     })
+}
+
+async fn machine_sync_overview(
+    db: &PgPool,
+    machine: &sqlx::postgres::PgRow,
+    machine_id: &str,
+) -> Result<MachineSyncStatus, ApiError> {
+    let files = file_counts(db, machine_id).await?;
+    Ok(MachineSyncStatus {
+        machine_id: machine_id.to_string(),
+        hostname: machine.get("hostname"),
+        installation_id: machine.get("installation_id"),
+        first_seen_at: machine.get("first_seen_at"),
+        last_seen_at: machine.get("last_seen_at"),
+        files: SyncFileCounts {
+            active_rollout: files.get("active_rollout"),
+            archived_rollout: files.get("archived_rollout"),
+            session_index: files.get("session_index"),
+            total: files.get("total"),
+            today: files.get("today"),
+        },
+        content: SyncContentCounts {
+            threads: 0,
+            raw_lines: 0,
+            chunks: 0,
+            today_raw_lines: 0,
+            today_chunks: 0,
+        },
+        embeddings: Vec::new(),
+        ingest_errors: Vec::new(),
+    })
+}
+
+async fn file_counts(db: &PgPool, machine_id: &str) -> Result<sqlx::postgres::PgRow, ApiError> {
+    Ok(sqlx::query(
+        r#"
+        SELECT
+          count(*) FILTER (WHERE kind = 'active_rollout') AS active_rollout,
+          count(*) FILTER (WHERE kind = 'archived_rollout') AS archived_rollout,
+          count(*) FILTER (WHERE kind = 'session_index') AS session_index,
+          count(*) AS total,
+          count(*) FILTER (WHERE relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
+                            OR relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today
+        FROM rollout_files
+        WHERE machine_id = $1
+        "#,
+    )
+    .bind(machine_id)
+    .fetch_one(db)
+    .await?)
 }
 
 async fn status_counts(
