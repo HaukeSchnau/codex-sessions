@@ -24,8 +24,8 @@ const DEFAULT_PRUNE_MIN_AGE_DAYS: u64 = 30;
 const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 4;
 
 #[derive(Debug, Parser)]
-#[command(name = "archive-agent")]
-#[command(about = "Push local Codex rollout JSONL into codex-session archive-server")]
+#[command(name = "codex-session-archive-agent")]
+#[command(about = "Push local Codex rollout JSONL into the Codex session archive server")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -956,7 +956,8 @@ mod tests {
     #[test]
     fn prune_removes_empty_rollout_dirs_without_touching_root() {
         let unique = Uuid::new_v4().to_string();
-        let codex_home = std::env::temp_dir().join(format!("archive-agent-prune-{unique}"));
+        let codex_home = std::env::temp_dir()
+            .join(format!("codex-session-archive-agent-prune-{unique}"));
         let day_dir = codex_home.join("sessions/2026/05/27");
         fs::create_dir_all(&day_dir).unwrap();
         let file_path = day_dir.join("rollout-a.jsonl");

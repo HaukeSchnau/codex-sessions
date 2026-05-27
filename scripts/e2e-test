@@ -49,7 +49,7 @@ cat >"$fixture_home/session_index.jsonl" <<JSONL
 {"id":"$thread_id","thread_name":"E2E Archive Thread $sentinel","updated_at":"2026-05-27T12:06:00Z"}
 JSONL
 
-cargo run -q -p archive-agent -- scan \
+cargo run -q -p codex-session-archive-agent -- scan \
   --server "$base_url" \
   --token "$ARCHIVE_INGEST_TOKEN" \
   --codex-home "$fixture_home"

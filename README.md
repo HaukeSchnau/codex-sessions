@@ -6,7 +6,7 @@ Central archive/search service for Codex rollout JSONL.
 
 - `archive-core`: permissive rollout parsing, metadata extraction, chunking, and hashing.
 - `archive-server`: Axum HTTP API backed by Postgres, full-text search, and `pgvector`.
-- `archive-agent`: local push agent that scans `CODEX_HOME` and uploads complete JSONL records.
+- `codex-session-archive-agent`: local push agent that scans `CODEX_HOME` and uploads complete JSONL records.
 
 ## Server
 
@@ -41,7 +41,7 @@ Build the regular binaries with Nix:
 
 ```sh
 nix build .#archive-server
-nix build .#archive-agent
+nix build .#codex-session-archive-agent
 ```
 
 Build the Docker image tarball with Nix and load it into Docker on Linux:
@@ -95,7 +95,7 @@ cargo run -p archive-server
 One-shot import:
 
 ```sh
-cargo run -p archive-agent -- scan \
+cargo run -p codex-session-archive-agent -- scan \
   --server http://127.0.0.1:8787 \
   --token-file ./ingest-token \
   --codex-home ~/.codex \
@@ -105,7 +105,7 @@ cargo run -p archive-agent -- scan \
 Continuous import:
 
 ```sh
-cargo run -p archive-agent -- watch \
+cargo run -p codex-session-archive-agent -- watch \
   --server http://127.0.0.1:8787 \
   --token-file ./ingest-token \
   --codex-home ~/.codex \
@@ -117,7 +117,7 @@ The agent asks the server for per-file cursors before each scan, skips already-i
 Prune local rollout files that are already fully archived on the server:
 
 ```sh
-cargo run -p archive-agent -- prune \
+cargo run -p codex-session-archive-agent -- prune \
   --server http://127.0.0.1:8787 \
   --token-file ./ingest-token \
   --codex-home ~/.codex \

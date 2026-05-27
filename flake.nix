@@ -43,12 +43,12 @@
             doCheck = true;
           };
         archiveServerPackage = mkArchiveCrate pkgs "archive-server";
-        archiveAgentPackage = mkArchiveCrate pkgs "archive-agent";
+        codexSessionArchiveAgentPackage = mkArchiveCrate pkgs "codex-session-archive-agent";
         archivePackage = pkgs.symlinkJoin {
           name = "codex-session-archive-0.1.0";
           paths = [
             archiveServerPackage
-            archiveAgentPackage
+            codexSessionArchiveAgentPackage
           ];
         };
         mkArchiveServerImage =
@@ -104,7 +104,8 @@
           default = archivePackage;
           codex-session-archive = archivePackage;
           archive-server = archiveServerPackage;
-          archive-agent = archiveAgentPackage;
+          codex-session-archive-agent = codexSessionArchiveAgentPackage;
+          archive-agent = codexSessionArchiveAgentPackage;
           archive-server-image = archiveServerImage;
         };
 
@@ -114,10 +115,15 @@
             program = "${archiveServerPackage}/bin/archive-server";
             meta.description = "Run the Codex session archive HTTP server";
           };
+          codex-session-archive-agent = {
+            type = "app";
+            program = "${codexSessionArchiveAgentPackage}/bin/codex-session-archive-agent";
+            meta.description = "Run the Codex session archive local import agent";
+          };
           archive-agent = {
             type = "app";
-            program = "${archiveAgentPackage}/bin/archive-agent";
-            meta.description = "Run the Codex session archive local import agent";
+            program = "${codexSessionArchiveAgentPackage}/bin/codex-session-archive-agent";
+            meta.description = "Compatibility alias for codex-session-archive-agent";
           };
         };
 
@@ -142,6 +148,7 @@
     )
     // {
       nixosModules.archive-server = import ./nix/nixos/archive-server.nix { inherit self; };
-      homeManagerModules.archive-agent = import ./nix/home-manager/archive-agent.nix { inherit self; };
+      homeManagerModules.codex-session-archive-agent = import ./nix/home-manager/archive-agent.nix { inherit self; };
+      homeManagerModules.archive-agent = self.homeManagerModules.codex-session-archive-agent;
     };
 }

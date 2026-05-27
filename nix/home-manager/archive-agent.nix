@@ -44,11 +44,11 @@ let
   );
   runAgent = pkgs.writeShellScript "codex-session-archive-agent" ''
     set -euo pipefail
-    exec ${cfg.package}/bin/archive-agent ${runAgentArgs}
+    exec ${cfg.package}/bin/codex-session-archive-agent ${runAgentArgs}
   '';
   runPrune = pkgs.writeShellScript "codex-session-archive-prune" ''
     set -euo pipefail
-    exec ${cfg.package}/bin/archive-agent ${runPruneArgs}
+    exec ${cfg.package}/bin/codex-session-archive-agent ${runPruneArgs}
   '';
 in
 {
@@ -57,9 +57,9 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${system}.archive-agent;
-      defaultText = lib.literalExpression "codex-sessions.packages.\${system}.archive-agent";
-      description = "Package providing the archive-agent binary.";
+      default = self.packages.${system}.codex-session-archive-agent;
+      defaultText = lib.literalExpression "codex-sessions.packages.\${system}.codex-session-archive-agent";
+      description = "Package providing the codex-session-archive-agent binary.";
     };
 
     serverUrl = lib.mkOption {
