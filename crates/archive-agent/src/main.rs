@@ -20,7 +20,7 @@ const PREFIX_HASH_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_LINES_PER_BATCH: usize = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_PRUNE_MIN_AGE_DAYS: u64 = 30;
-const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 2;
+const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug, Parser)]
 #[command(name = "archive-agent")]

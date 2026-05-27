@@ -24,7 +24,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 const READ_COOKIE_NAME: &str = "archive_read_token";
-const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 2;
+const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 3;
 
 #[derive(Clone)]
 struct AppState {
