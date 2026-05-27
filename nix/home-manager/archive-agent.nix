@@ -16,6 +16,8 @@ let
       --server ${lib.escapeShellArg cfg.serverUrl} \
       --token "$token" \
       --codex-home ${lib.escapeShellArg cfg.codexHome} \
+      --max-lines-per-batch ${toString cfg.maxLinesPerBatch} \
+      --request-timeout-seconds ${toString cfg.requestTimeoutSeconds} \
       --interval-seconds ${toString cfg.intervalSeconds} \
       --quiet
   '';
@@ -52,6 +54,18 @@ in
       type = lib.types.ints.positive;
       default = 30;
       description = "Scan interval for watch mode.";
+    };
+
+    maxLinesPerBatch = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 5000;
+      description = "Maximum complete JSONL records to upload per ingest request.";
+    };
+
+    requestTimeoutSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 600;
+      description = "HTTP request timeout for cursor and ingest requests.";
     };
   };
 

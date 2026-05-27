@@ -17,6 +17,7 @@ use walkdir::WalkDir;
 
 const PREFIX_HASH_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_LINES_PER_BATCH: usize = 5_000;
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Debug, Parser)]
 #[command(name = "archive-agent")]
@@ -42,6 +43,8 @@ struct AgentOptions {
     codex_home: PathBuf,
     #[arg(long, default_value_t = DEFAULT_MAX_LINES_PER_BATCH)]
     max_lines_per_batch: usize,
+    #[arg(long, default_value_t = DEFAULT_REQUEST_TIMEOUT_SECONDS)]
+    request_timeout_seconds: u64,
     #[arg(long)]
     json: bool,
     #[arg(long)]
@@ -82,10 +85,13 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
     if options.max_lines_per_batch == 0 {
         bail!("--max-lines-per-batch must be greater than zero");
     }
+    if options.request_timeout_seconds == 0 {
+        bail!("--request-timeout-seconds must be greater than zero");
+    }
     let codex_home = expand_tilde(options.codex_home.clone());
     let machine = machine_identity(&codex_home)?;
     let client = Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(options.request_timeout_seconds))
         .build()
         .context("build HTTP client")?;
     let endpoint = format!("{}/v1/ingest/batch", options.server.trim_end_matches('/'));
