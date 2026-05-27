@@ -18,9 +18,10 @@ use walkdir::WalkDir;
 
 const PREFIX_HASH_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_LINES_PER_BATCH: usize = 5_000;
+const DEFAULT_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_PRUNE_MIN_AGE_DAYS: u64 = 30;
-const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 3;
+const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 4;
 
 #[derive(Debug, Parser)]
 #[command(name = "archive-agent")]
@@ -61,6 +62,8 @@ struct AgentOptions {
     common: CommonOptions,
     #[arg(long, default_value_t = DEFAULT_MAX_LINES_PER_BATCH)]
     max_lines_per_batch: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_BATCH_BYTES)]
+    max_batch_bytes: usize,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -109,6 +112,9 @@ async fn watch(options: WatchOptions) -> anyhow::Result<()> {
 async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
     if options.max_lines_per_batch == 0 {
         bail!("--max-lines-per-batch must be greater than zero");
+    }
+    if options.max_batch_bytes == 0 {
+        bail!("--max-batch-bytes must be greater than zero");
     }
     if options.common.request_timeout_seconds == 0 {
         bail!("--request-timeout-seconds must be greater than zero");
@@ -176,11 +182,15 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
             .iter()
             .map(|line| line.byte_end.saturating_sub(line.byte_start))
             .sum::<u64>();
-        for chunk in upload_lines.chunks(options.max_lines_per_batch) {
+        for chunk in line_batches(
+            &upload_lines,
+            options.max_lines_per_batch,
+            options.max_batch_bytes,
+        ) {
             let batch = AgentBatch {
                 machine: machine.clone(),
                 file: prepared.metadata.clone(),
-                lines: chunk.to_vec(),
+                lines: chunk,
             };
             let response = client
                 .post(&endpoint)
@@ -598,6 +608,36 @@ fn emit_summary(options: &CommonOptions, stats: &ScanStats) {
     }
 }
 
+fn line_batches(
+    lines: &[AgentLine],
+    max_lines: usize,
+    max_batch_bytes: usize,
+) -> Vec<Vec<AgentLine>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0usize;
+
+    for line in lines {
+        let estimated_bytes = estimated_line_batch_bytes(line);
+        let would_overflow = !current.is_empty()
+            && (current.len() >= max_lines
+                || current_bytes.saturating_add(estimated_bytes) > max_batch_bytes);
+        if would_overflow {
+            batches.push(current);
+            current = Vec::new();
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(estimated_bytes);
+        current.push(line.clone());
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
+}
+
 fn emit_prune_progress(
     options: &CommonOptions,
     event: &str,
@@ -691,6 +731,10 @@ fn cursor_prefix_matches(prepared: &PreparedFile, cursor: &FileCursor) -> bool {
         .get(..prefix_len)
         .map(|prefix| sha256_hex(prefix) == cursor.prefix_hash)
         .unwrap_or(false)
+}
+
+fn estimated_line_batch_bytes(line: &AgentLine) -> usize {
+    line.raw.len().saturating_add(256)
 }
 
 fn file_fully_archived(prepared: &PreparedFile, cursor: Option<&FileCursor>) -> bool {
@@ -973,5 +1017,39 @@ mod tests {
                 .len() as i64,
             archived: false,
         }
+    }
+
+    #[test]
+    fn line_batches_split_on_estimated_request_bytes() {
+        let lines = vec![
+            AgentLine {
+                line_number: 1,
+                byte_start: 0,
+                byte_end: 1024,
+                raw: "a".repeat(900),
+                content_hash: "1".to_string(),
+            },
+            AgentLine {
+                line_number: 2,
+                byte_start: 1024,
+                byte_end: 2048,
+                raw: "b".repeat(900),
+                content_hash: "2".to_string(),
+            },
+            AgentLine {
+                line_number: 3,
+                byte_start: 2048,
+                byte_end: 3072,
+                raw: "c".repeat(900),
+                content_hash: "3".to_string(),
+            },
+        ];
+
+        let batches = line_batches(&lines, 10, 2_200);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0][0].line_number, 1);
+        assert_eq!(batches[1][0].line_number, 2);
+        assert_eq!(batches[2][0].line_number, 3);
     }
 }
