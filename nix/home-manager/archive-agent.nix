@@ -11,10 +11,9 @@ let
   logDir = "${config.home.homeDirectory}/Library/Logs/codex-session-archive";
   runAgent = pkgs.writeShellScript "codex-session-archive-agent" ''
     set -euo pipefail
-    token="$(cat ${lib.escapeShellArg cfg.ingestTokenFile})"
     exec ${cfg.package}/bin/archive-agent watch \
       --server ${lib.escapeShellArg cfg.serverUrl} \
-      --token "$token" \
+      --token-file ${lib.escapeShellArg cfg.ingestTokenFile} \
       --codex-home ${lib.escapeShellArg cfg.codexHome} \
       --max-lines-per-batch ${toString cfg.maxLinesPerBatch} \
       --request-timeout-seconds ${toString cfg.requestTimeoutSeconds} \

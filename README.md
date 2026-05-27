@@ -67,6 +67,9 @@ export ARCHIVE_READ_TOKEN=change-me-read
 export OPENAI_API_KEY=sk-...
 ```
 
+For local agent runs, prefer storing the ingest token in a file and passing
+`--token-file` so it does not appear in process listings.
+
 Optional:
 
 ```sh
@@ -89,7 +92,7 @@ One-shot import:
 ```sh
 cargo run -p archive-agent -- scan \
   --server http://127.0.0.1:8787 \
-  --token "$ARCHIVE_INGEST_TOKEN" \
+  --token-file ./ingest-token \
   --codex-home ~/.codex \
   --json
 ```
@@ -99,7 +102,7 @@ Continuous import:
 ```sh
 cargo run -p archive-agent -- watch \
   --server http://127.0.0.1:8787 \
-  --token "$ARCHIVE_INGEST_TOKEN" \
+  --token-file ./ingest-token \
   --codex-home ~/.codex \
   --interval-seconds 30
 ```

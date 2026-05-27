@@ -37,8 +37,10 @@ enum Command {
 struct AgentOptions {
     #[arg(long, env = "ARCHIVE_SERVER_URL")]
     server: String,
-    #[arg(long, env = "ARCHIVE_INGEST_TOKEN")]
-    token: String,
+    #[arg(long, env = "ARCHIVE_INGEST_TOKEN", conflicts_with = "token_file")]
+    token: Option<String>,
+    #[arg(long, env = "ARCHIVE_INGEST_TOKEN_FILE", conflicts_with = "token")]
+    token_file: Option<PathBuf>,
     #[arg(long, env = "CODEX_HOME", default_value = "~/.codex")]
     codex_home: PathBuf,
     #[arg(long, default_value_t = DEFAULT_MAX_LINES_PER_BATCH)]
@@ -88,6 +90,7 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
     if options.request_timeout_seconds == 0 {
         bail!("--request-timeout-seconds must be greater than zero");
     }
+    let token = ingest_token(&options)?;
     let codex_home = expand_tilde(options.codex_home.clone());
     let machine = machine_identity(&codex_home)?;
     let client = Client::builder()
@@ -95,7 +98,7 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
         .build()
         .context("build HTTP client")?;
     let endpoint = format!("{}/v1/ingest/batch", options.server.trim_end_matches('/'));
-    let cursors = fetch_cursors(&client, &options, &machine.machine_id).await?;
+    let cursors = fetch_cursors(&client, &options, &token, &machine.machine_id).await?;
 
     let mut files = discover_files(&codex_home)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -154,7 +157,7 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
             };
             let response = client
                 .post(&endpoint)
-                .bearer_auth(&options.token)
+                .bearer_auth(&token)
                 .json(&batch)
                 .send()
                 .await
@@ -192,6 +195,23 @@ async fn scan_once(options: AgentOptions) -> anyhow::Result<()> {
     stats.elapsed_ms = started.elapsed().as_millis() as u64;
     emit_summary(&options, &stats);
     Ok(())
+}
+
+fn ingest_token(options: &AgentOptions) -> anyhow::Result<String> {
+    match (&options.token, &options.token_file) {
+        (Some(token), None) => Ok(token.clone()),
+        (None, Some(path)) => fs::read_to_string(path)
+            .with_context(|| format!("read ingest token from {}", path.display()))
+            .map(|token| token.trim().to_string())
+            .and_then(|token| {
+                if token.is_empty() {
+                    bail!("ingest token file is empty")
+                }
+                Ok(token)
+            }),
+        (None, None) => bail!("provide --token or --token-file"),
+        (Some(_), Some(_)) => bail!("provide only one of --token or --token-file"),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -310,6 +330,7 @@ fn file_metadata_matches_cursor(path: &Path, cursor: &FileCursor) -> anyhow::Res
 async fn fetch_cursors(
     client: &Client,
     options: &AgentOptions,
+    token: &str,
     machine_id: &str,
 ) -> anyhow::Result<HashMap<String, FileCursor>> {
     let endpoint = format!(
@@ -319,7 +340,7 @@ async fn fetch_cursors(
     );
     let response = client
         .get(&endpoint)
-        .bearer_auth(&options.token)
+        .bearer_auth(token)
         .send()
         .await
         .with_context(|| format!("GET {endpoint}"))?;
