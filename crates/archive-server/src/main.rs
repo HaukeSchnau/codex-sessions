@@ -1788,13 +1788,15 @@ async fn machine_sync_status(
     let line_counts_fut = sqlx::query(
         r#"
         SELECT
-          count(DISTINCT rl.thread_id) AS threads,
-          count(*) AS raw_lines,
-          count(*) FILTER (WHERE rf.relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
-                            OR rf.relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today_raw_lines
-        FROM rollout_lines rl
-        JOIN rollout_files rf ON rf.id = rl.file_id
-        WHERE rf.machine_id = $1
+          count(*) FILTER (WHERE kind IN ('active_rollout', 'archived_rollout')) AS threads,
+          COALESCE(sum(import_line_cursor) FILTER (WHERE kind IN ('active_rollout', 'archived_rollout')), 0) AS raw_lines,
+          COALESCE(sum(import_line_cursor) FILTER (
+            WHERE (relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
+               OR relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%')
+              AND kind IN ('active_rollout', 'archived_rollout')
+          ), 0) AS today_raw_lines
+        FROM rollout_files
+        WHERE machine_id = $1
         "#,
     )
     .bind(machine_id)
@@ -2717,13 +2719,23 @@ fn search_quality_multiplier(result: &SearchResult) -> f64 {
         multiplier *= 0.72;
     }
     if text.contains("<subagent_notification>") {
-        multiplier *= 0.22;
+        multiplier *= 0.08;
     }
     if text.contains("*** Begin Patch") {
         multiplier *= 0.75;
     }
     if text.contains("```") || text.contains("Commands I ran:") {
         multiplier *= 0.68;
+    }
+    if text.starts_with("I used the `codex-session-archive` skill")
+        || text.starts_with("I re-evaluated it")
+        || text.contains("The happy path mostly works.")
+        || text.contains("Main friction points:")
+        || text.contains("What improved:")
+        || text.contains("What still feels rough:")
+        || text.contains("first-time agent")
+    {
+        multiplier *= 0.42;
     }
     if text.starts_with("# AGENTS.md instructions") || text.starts_with("<skill>") {
         multiplier *= 0.6;
@@ -2732,7 +2744,7 @@ fn search_quality_multiplier(result: &SearchResult) -> f64 {
         multiplier *= 0.88;
     }
 
-    multiplier.clamp(0.15, 1.25)
+    multiplier.clamp(0.05, 1.25)
 }
 
 fn rerank_search_results(
@@ -3192,7 +3204,27 @@ mod tests {
             },
         };
 
-        assert!(search_quality_multiplier(&subagent) < 0.3);
+        assert!(search_quality_multiplier(&subagent) < 0.1);
+    }
+
+    #[test]
+    fn search_quality_penalizes_archive_evaluation_chatter() {
+        let evaluation = SearchResult {
+            chunk_id: 1,
+            thread_id: "thread-a".to_string(),
+            turn_id: None,
+            chunk_kind: "assistant_message".to_string(),
+            role: Some("assistant".to_string()),
+            text: "I used the `codex-session-archive` skill exactly the way a first-time agent would.\n\nThe happy path mostly works.\n\nMain friction points:\n- Search relevance is noisy.".to_string(),
+            score: 1.0,
+            citation: Citation {
+                thread_id: "thread-a".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+
+        assert!(search_quality_multiplier(&evaluation) < 0.5);
     }
 
     #[test]
