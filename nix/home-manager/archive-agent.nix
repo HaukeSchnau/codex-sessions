@@ -38,7 +38,6 @@ let
       (toString cfg.requestTimeoutSeconds)
       "--min-age-days"
       (toString cfg.prune.minAgeDays)
-      "--quiet"
     ]
     ++ lib.optionals cfg.prune.dryRun [ "--dry-run" ]
     ++ lib.optionals cfg.prune.skipArchivedSessions [ "--skip-archived-sessions" ]
