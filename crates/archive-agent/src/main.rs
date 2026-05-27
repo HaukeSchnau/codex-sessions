@@ -20,6 +20,7 @@ const PREFIX_HASH_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_LINES_PER_BATCH: usize = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_PRUNE_MIN_AGE_DAYS: u64 = 30;
+const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug, Parser)]
 #[command(name = "archive-agent")]
@@ -451,6 +452,9 @@ fn relative_path(codex_home: &Path, path: &Path) -> String {
 }
 
 fn file_metadata_matches_cursor(path: &Path, cursor: &FileCursor) -> anyhow::Result<bool> {
+    if cursor.import_schema_version < CURRENT_IMPORT_SCHEMA_VERSION {
+        return Ok(false);
+    }
     let metadata = fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
     if metadata.len() != cursor.size_bytes {
         return Ok(false);
@@ -693,7 +697,8 @@ fn file_fully_archived(prepared: &PreparedFile, cursor: Option<&FileCursor>) -> 
     let Some(cursor) = cursor else {
         return false;
     };
-    cursor.file_hash == prepared.metadata.file_hash
+    cursor.import_schema_version >= CURRENT_IMPORT_SCHEMA_VERSION
+        && cursor.file_hash == prepared.metadata.file_hash
         && cursor.size_bytes == prepared.metadata.size_bytes
         && cursor.import_byte_cursor >= prepared.complete_len as u64
 }
@@ -877,6 +882,18 @@ mod tests {
     }
 
     #[test]
+    fn stale_import_schema_forces_reupload() {
+        let prepared = prepared_with_bytes("sessions/2026/05/27/rollout-a.jsonl", b"one\ntwo\n");
+        let mut cursor = cursor_for(&prepared, prepared.complete_len as u64);
+        cursor.import_schema_version = CURRENT_IMPORT_SCHEMA_VERSION - 1;
+
+        let upload = lines_to_upload(&prepared, Some(&cursor)).unwrap();
+
+        assert_eq!(upload.len(), 2);
+        assert!(!file_fully_archived(&prepared, Some(&cursor)));
+    }
+
+    #[test]
     fn min_age_gate_uses_whole_days() {
         let now = DateTime::parse_from_rfc3339("2026-05-27T12:00:00Z")
             .unwrap()
@@ -945,6 +962,7 @@ mod tests {
             relative_path: prepared.metadata.relative_path.clone(),
             kind: prepared.metadata.kind.clone(),
             file_version: 1,
+            import_schema_version: CURRENT_IMPORT_SCHEMA_VERSION,
             size_bytes: prepared.metadata.size_bytes,
             modified_at: prepared.metadata.modified_at,
             file_hash: prepared.metadata.file_hash.clone(),

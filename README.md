@@ -112,7 +112,7 @@ cargo run -p archive-agent -- watch \
   --interval-seconds 30
 ```
 
-The agent asks the server for per-file cursors before each scan, skips already-imported files, and uploads only new complete JSONL records for append-only files. Use `--json` for agent-readable progress events or `--quiet` for silence.
+The agent asks the server for per-file cursors before each scan, skips already-imported files, and uploads only new complete JSONL records for append-only files. Cursor state now carries an ingest schema version, so when chunking or completeness rules improve the agent can do a one-time resend and let the server backfill missing raw lines, `session_index` history, and new searchable chunks. Use `--json` for agent-readable progress events or `--quiet` for silence.
 
 Prune local rollout files that are already fully archived on the server:
 
@@ -136,8 +136,8 @@ cargo run -p archive-agent -- prune \
 - `GET /v1/sync/status`
 - `POST /v1/embeddings/prioritize`
 - `GET /v1/threads`
-- `GET /v1/threads/{thread_id}`
-- `GET /v1/threads/{thread_id}/raw`
+- `GET /v1/threads/{thread_id}` including indexed chunks and archived thread-name history
+- `GET /v1/threads/{thread_id}/raw` (`include_private_model_traces=true` required for raw reasoning traces)
 - `GET /v1/search?q=...&mode=hybrid&scope=decisions`
 - `POST /v1/query` with optional `scope`: `decisions`, `problems`, `commands`, `today`, or `recent`
 - `GET /v1/export`

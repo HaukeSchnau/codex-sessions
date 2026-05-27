@@ -17,6 +17,8 @@ pub enum ChunkKind {
     Tool,
     Patch,
     Goal,
+    Lifecycle,
+    Reasoning,
     Warning,
     Error,
 }
@@ -31,6 +33,8 @@ impl ChunkKind {
             Self::Tool => "tool",
             Self::Patch => "patch",
             Self::Goal => "goal",
+            Self::Lifecycle => "lifecycle",
+            Self::Reasoning => "reasoning",
             Self::Warning => "warning",
             Self::Error => "error",
         }
@@ -143,6 +147,62 @@ fn extract_event_msg(payload: &Value) -> Option<(ChunkKind, Option<String>, Stri
                 )
             }),
         "agent_reasoning_raw_content" => None,
+        "task_started" => Some((
+            ChunkKind::Lifecycle,
+            None,
+            summarize_task_started(payload),
+            metadata_for_payload(payload),
+        )),
+        "task_complete" => Some((
+            ChunkKind::Lifecycle,
+            None,
+            summarize_task_complete(payload),
+            metadata_for_payload(payload),
+        )),
+        "thread_rolled_back" => Some((
+            ChunkKind::Lifecycle,
+            None,
+            summarize_thread_rolled_back(payload),
+            metadata_for_payload(payload),
+        )),
+        "turn_aborted" => Some((
+            ChunkKind::Lifecycle,
+            None,
+            summarize_turn_aborted(payload),
+            metadata_for_payload(payload),
+        )),
+        "item_completed" => summarize_item_completed(payload).map(|text| {
+            (
+                ChunkKind::Lifecycle,
+                None,
+                text,
+                metadata_for_payload(payload),
+            )
+        }),
+        "thread_name_updated" => payload
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                (
+                    ChunkKind::Lifecycle,
+                    None,
+                    format!("Thread renamed: {text}"),
+                    metadata_for_payload(payload),
+                )
+            }),
+        "view_image_tool_call"
+        | "collab_agent_spawn_end"
+        | "collab_waiting_end"
+        | "collab_close_end" => {
+            let text = summarize_event_with_preferred_fields(
+                event_type,
+                payload,
+                &["path", "prompt", "/status/completed", "thread_name"],
+            );
+            Some((ChunkKind::Tool, None, text, metadata_for_payload(payload)))
+        }
         "exec_command_begin" => {
             let command = payload
                 .get("command")
@@ -258,39 +318,57 @@ fn extract_event_msg(payload: &Value) -> Option<(ChunkKind, Option<String>, Stri
 }
 
 fn extract_response_item(payload: &Value) -> Option<(ChunkKind, Option<String>, String, Value)> {
-    if payload.get("type").and_then(Value::as_str) != Some("message") {
-        return None;
+    match payload.get("type").and_then(Value::as_str)? {
+        "message" => {
+            let role = payload.get("role").and_then(Value::as_str)?.to_string();
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let text = payload
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            item.get("text")
+                                .and_then(Value::as_str)
+                                .or_else(|| item.get("input_text").and_then(Value::as_str))
+                                .or_else(|| item.get("output_text").and_then(Value::as_str))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })?
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let kind = if role == "user" {
+                ChunkKind::UserMessage
+            } else {
+                ChunkKind::AssistantMessage
+            };
+            Some((kind, Some(role), text, metadata_for_payload(payload)))
+        }
+        "function_call" | "custom_tool_call" => summarize_response_tool_call(payload)
+            .map(|text| (ChunkKind::Tool, None, text, metadata_for_payload(payload))),
+        "function_call_output" | "custom_tool_call_output" => {
+            summarize_response_tool_output(payload)
+                .map(|text| (ChunkKind::Tool, None, text, metadata_for_payload(payload)))
+        }
+        "web_search_call" => summarize_web_search_call(payload)
+            .map(|text| (ChunkKind::Tool, None, text, metadata_for_payload(payload))),
+        "reasoning" => summarize_reasoning(payload).map(|text| {
+            (
+                ChunkKind::Reasoning,
+                None,
+                text,
+                metadata_for_payload(payload),
+            )
+        }),
+        _ => None,
     }
-    let role = payload.get("role").and_then(Value::as_str)?.to_string();
-    if role != "user" && role != "assistant" {
-        return None;
-    }
-    let text = payload
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    item.get("text")
-                        .and_then(Value::as_str)
-                        .or_else(|| item.get("input_text").and_then(Value::as_str))
-                        .or_else(|| item.get("output_text").and_then(Value::as_str))
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        })?
-        .trim()
-        .to_string();
-    if text.is_empty() {
-        return None;
-    }
-    let kind = if role == "user" {
-        ChunkKind::UserMessage
-    } else {
-        ChunkKind::AssistantMessage
-    };
-    Some((kind, Some(role), text, metadata_for_payload(payload)))
 }
 
 fn split_large_text(text: String) -> Vec<String> {
@@ -339,6 +417,216 @@ fn compact_json_summary(event_type: &str, payload: &Value) -> String {
     text
 }
 
+fn summarize_task_started(payload: &Value) -> String {
+    let turn_id = payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mode = payload
+        .get("collaboration_mode_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    match payload.get("model_context_window").and_then(Value::as_i64) {
+        Some(window) => {
+            format!("Task started for turn {turn_id} in {mode} mode (context window {window})")
+        }
+        None => format!("Task started for turn {turn_id} in {mode} mode"),
+    }
+}
+
+fn summarize_task_complete(payload: &Value) -> String {
+    let message = payload
+        .get("last_agent_message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    match message {
+        Some(message) => format!("Task completed\n{message}"),
+        None => "Task completed".to_string(),
+    }
+}
+
+fn summarize_thread_rolled_back(payload: &Value) -> String {
+    let turns = payload
+        .get("num_turns")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    format!("Thread rolled back by {turns} turn(s)")
+}
+
+fn summarize_turn_aborted(payload: &Value) -> String {
+    let reason = payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    match payload.get("duration_ms").and_then(Value::as_i64) {
+        Some(duration_ms) => format!("Turn aborted: {reason} after {duration_ms} ms"),
+        None => format!("Turn aborted: {reason}"),
+    }
+}
+
+fn summarize_item_completed(payload: &Value) -> Option<String> {
+    let item = payload.get("item")?.as_object()?;
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("item");
+    let text = item.get("text").and_then(Value::as_str).map(str::trim);
+    Some(match text.filter(|text| !text.is_empty()) {
+        Some(text) => format!("{item_type} completed\n{text}"),
+        None => format!("{item_type} completed"),
+    })
+}
+
+fn summarize_event_with_preferred_fields(
+    event_type: &str,
+    payload: &Value,
+    preferred_fields: &[&str],
+) -> String {
+    for field in preferred_fields {
+        let text = if field.starts_with('/') {
+            payload.pointer(field).and_then(value_to_string)
+        } else {
+            payload.get(*field).and_then(value_to_string)
+        };
+        if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+            return format!("{event_type}\n{text}");
+        }
+    }
+    compact_json_summary(event_type, payload)
+}
+
+fn summarize_response_tool_call(payload: &Value) -> Option<String> {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("tool_call");
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let input = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(compact_json_or_text)
+        .or_else(|| {
+            payload
+                .get("input")
+                .and_then(Value::as_str)
+                .map(compact_json_or_text)
+        })
+        .filter(|text| !text.is_empty());
+    Some(match input {
+        Some(input) => format!("{kind} {name}\n{input}"),
+        None => format!("{kind} {name}"),
+    })
+}
+
+fn summarize_response_tool_output(payload: &Value) -> Option<String> {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("tool_output");
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let output = payload
+        .get("output")
+        .and_then(Value::as_str)
+        .map(compact_json_or_text)
+        .filter(|text| !text.is_empty());
+    Some(match output {
+        Some(output) => format!("{kind} {call_id}\n{output}"),
+        None => format!("{kind} {call_id}"),
+    })
+}
+
+fn summarize_web_search_call(payload: &Value) -> Option<String> {
+    let action = payload.get("action")?;
+    let query = action
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let queries = action
+        .get("queries")
+        .and_then(Value::as_array)
+        .map(|queries| {
+            queries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let body = if let Some(query) = query {
+        let mut body = vec![query.to_string()];
+        for extra in queries {
+            if extra != query {
+                body.push(extra.to_string());
+            }
+        }
+        body.join("\n")
+    } else if queries.is_empty() {
+        String::new()
+    } else {
+        queries.join("\n")
+    };
+    Some(if body.is_empty() {
+        "web_search_call".to_string()
+    } else {
+        format!("web_search_call\n{body}")
+    })
+}
+
+fn summarize_reasoning(payload: &Value) -> Option<String> {
+    let parts = payload
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(reasoning_summary_entry)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("Reasoning summary\n{}", parts.join("\n")))
+    }
+}
+
+fn reasoning_summary_entry(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        Value::Object(map) => map
+            .get("text")
+            .or_else(|| map.get("summary"))
+            .or_else(|| map.get("content"))
+            .and_then(value_to_string)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()),
+        _ => None,
+    }
+}
+
+fn compact_json_or_text(text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| text.trim().to_string())
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_string()),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
 fn metadata_for(line: &RolloutLine, extra: Option<Value>) -> Value {
     let mut metadata = serde_json::Map::new();
     metadata.insert("type".to_string(), Value::String(line.item_type.clone()));
@@ -355,9 +643,25 @@ fn metadata_for_payload(payload: &Value) -> Value {
             "event_type".to_string(),
             Value::String(event_type.to_string()),
         );
+        metadata.insert(
+            "payload_type".to_string(),
+            Value::String(event_type.to_string()),
+        );
     }
     if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
         metadata.insert("call_id".to_string(), Value::String(call_id.to_string()));
+    }
+    if let Some(name) = payload.get("name").and_then(Value::as_str) {
+        metadata.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(thread_id) = payload.get("thread_id").and_then(Value::as_str) {
+        metadata.insert(
+            "thread_id".to_string(),
+            Value::String(thread_id.to_string()),
+        );
+    }
+    if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
+        metadata.insert("turn_id".to_string(), Value::String(turn_id.to_string()));
     }
     Value::Object(metadata)
 }
@@ -389,6 +693,39 @@ mod tests {
             .iter()
             .any(|chunk| chunk.text.contains("rg decision")));
         assert!(!chunks.iter().any(|chunk| chunk.text.contains("secret-ish")));
+    }
+
+    #[test]
+    fn chunks_response_tool_calls_and_reasoning_summaries() {
+        let raw = [
+            r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"turn_context","payload":{"turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}","call_id":"call-1"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"output\":\"/tmp\"}"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:03.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"text":"Check the workspace first."}]}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:04.000Z","type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}"#,
+        ];
+        let parsed = raw
+            .iter()
+            .enumerate()
+            .map(|(idx, raw)| ((idx + 1) as i64, RolloutLine::parse(raw).unwrap()))
+            .collect::<Vec<_>>();
+
+        let chunks = chunk_rollout_lines(&parsed);
+
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("function_call exec_command")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("function_call_output call-1")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.chunk_kind == ChunkKind::Reasoning
+                && chunk.text.contains("Check the workspace first.")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.chunk_kind == ChunkKind::Lifecycle
+                && chunk.text.contains("rolled back by 2 turn")));
     }
 
     #[test]

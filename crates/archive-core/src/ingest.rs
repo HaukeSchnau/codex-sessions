@@ -58,6 +58,7 @@ pub struct FileCursor {
     pub relative_path: String,
     pub kind: FileKind,
     pub file_version: i32,
+    pub import_schema_version: i32,
     pub size_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<DateTime<Utc>>,

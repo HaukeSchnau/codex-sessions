@@ -24,6 +24,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 const READ_COOKIE_NAME: &str = "archive_read_token";
+const CURRENT_IMPORT_SCHEMA_VERSION: i32 = 2;
 
 #[derive(Clone)]
 struct AppState {
@@ -502,8 +503,8 @@ async fn ui_thread(
     if !has_read_access(&headers, &state.read_token) {
         return Ok(Redirect::to("/ui/login").into_response());
     }
-    let (thread, chunks) = fetch_thread_and_chunks(&state.db, &thread_id).await?;
-    Ok(render_thread_page(&thread, &chunks).into_response())
+    let (thread, chunks, name_history) = fetch_thread_and_chunks(&state.db, &thread_id).await?;
+    Ok(render_thread_page(&thread, &chunks, &name_history).into_response())
 }
 
 async fn ingest_batch(
@@ -544,8 +545,8 @@ async fn ingest_cursors(
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT ON (relative_path)
-               relative_path, kind, archived, file_version, size_bytes, modified_at, file_hash, prefix_hash,
-               import_byte_cursor, import_line_cursor
+               relative_path, kind, archived, file_version, import_schema_version, size_bytes,
+               modified_at, file_hash, prefix_hash, import_byte_cursor, import_line_cursor
         FROM rollout_files
         WHERE machine_id = $1
         ORDER BY relative_path, file_version DESC
@@ -561,6 +562,7 @@ async fn ingest_cursors(
             kind: file_kind_from_db(row.get::<String, _>("kind").as_str()),
             archived: row.get("archived"),
             file_version: row.get("file_version"),
+            import_schema_version: row.get("import_schema_version"),
             size_bytes: row.get::<i64, _>("size_bytes") as u64,
             modified_at: row.get("modified_at"),
             file_hash: row.get("file_hash"),
@@ -641,9 +643,10 @@ async fn read_thread(
     Path(thread_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     require_read_access(&headers, &state.read_token)?;
-    let (thread, chunks) = fetch_thread_and_chunks(&state.db, &thread_id).await?;
+    let (thread, chunks, name_history) = fetch_thread_and_chunks(&state.db, &thread_id).await?;
     Ok(Json(json!({
         "thread": thread_to_json(&thread),
+        "name_history": name_history,
         "chunks": chunks.iter().map(chunk_to_json_ref).collect::<Vec<_>>(),
         "turns": normalized_turns(&chunks),
     })))
@@ -840,7 +843,14 @@ async fn fetch_threads(
 async fn fetch_thread_and_chunks(
     db: &PgPool,
     thread_id: &str,
-) -> Result<(sqlx::postgres::PgRow, Vec<sqlx::postgres::PgRow>), ApiError> {
+) -> Result<
+    (
+        sqlx::postgres::PgRow,
+        Vec<sqlx::postgres::PgRow>,
+        Vec<Value>,
+    ),
+    ApiError,
+> {
     let thread = sqlx::query("SELECT * FROM threads WHERE thread_id = $1")
         .bind(thread_id)
         .fetch_optional(db)
@@ -855,7 +865,28 @@ async fn fetch_thread_and_chunks(
     .bind(thread_id)
     .fetch_all(db)
     .await?;
-    Ok((thread, chunks))
+    let name_history = sqlx::query(
+        r#"
+        SELECT thread_name, updated_at, raw
+        FROM session_index_lines
+        WHERE thread_id = $1
+        ORDER BY updated_at DESC NULLS LAST, line_number DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(thread_id)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|row| {
+        json!({
+            "thread_name": row.get::<Option<String>, _>("thread_name"),
+            "updated_at": row.get::<Option<DateTime<Utc>>, _>("updated_at"),
+            "raw": row.get::<String, _>("raw"),
+        })
+    })
+    .collect();
+    Ok((thread, chunks, name_history))
 }
 
 fn render_login_page(error: Option<&str>) -> Html<String> {
@@ -1027,6 +1058,7 @@ fn render_search_page(params: &UiSearchParams, results: &[SearchResult]) -> Html
 fn render_thread_page(
     thread: &sqlx::postgres::PgRow,
     chunks: &[sqlx::postgres::PgRow],
+    name_history: &[Value],
 ) -> Html<String> {
     let thread_id = thread.get::<String, _>("thread_id");
     let name = thread.get::<Option<String>, _>("name");
@@ -1066,6 +1098,27 @@ fn render_thread_page(
     if chunk_html.is_empty() {
         chunk_html.push_str("<p class=\"muted\">No chunks indexed for this thread yet.</p>");
     }
+    let mut history_html = String::new();
+    for entry in name_history {
+        let thread_name = entry
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("(unnamed)");
+        let updated_at = entry
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        history_html.push_str(&format!(
+            "<li><strong>{}</strong> <span class=\"muted\">{}</span></li>",
+            html_escape(thread_name),
+            html_escape(&updated_at),
+        ));
+    }
+    if history_html.is_empty() {
+        history_html.push_str("<li><span class=\"muted\">No archived name history.</span></li>");
+    }
     render_page(
         &format!("Codex Thread {title}"),
         &format!(
@@ -1083,6 +1136,10 @@ fn render_thread_page(
               <p><a href="{raw_json}">Raw JSON</a> · <a href="{raw_jsonl}">Raw JSONL</a></p>
             </section>
             <section>
+              <h2>Name History</h2>
+              <ul class="list">{history_html}</ul>
+            </section>
+            <section>
               <h2>Chunks</h2>
               {chunk_html}
             </section>
@@ -1096,6 +1153,7 @@ fn render_thread_page(
             git_branch = html_escape(display_str(git_branch.as_deref())),
             raw_json = raw_json,
             raw_jsonl = raw_jsonl,
+            history_html = history_html,
             chunk_html = chunk_html,
         ),
     )
@@ -1247,9 +1305,32 @@ async fn ingest_session_index(
     batch: &AgentBatch,
 ) -> Result<IngestResponse, ApiError> {
     let file_id = upsert_file(tx, batch).await?;
+    let file_version = current_file_version(tx, file_id).await?;
     let mut accepted = 0usize;
     for line in &batch.lines {
-        if let Some(update) = parse_thread_name_update(&line.raw) {
+        let update = parse_thread_name_update(&line.raw);
+        let result = sqlx::query(
+            r#"
+            INSERT INTO session_index_lines(file_id, file_version, line_number, byte_start, byte_end,
+                                            thread_id, thread_name, updated_at, raw, content_hash)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(file_id)
+        .bind(file_version)
+        .bind(line.line_number)
+        .bind(line.byte_start as i64)
+        .bind(line.byte_end as i64)
+        .bind(update.as_ref().map(|entry| entry.thread_id.clone()))
+        .bind(update.as_ref().map(|entry| entry.thread_name.clone()))
+        .bind(update.as_ref().and_then(|entry| entry.updated_at))
+        .bind(&line.raw)
+        .bind(&line.content_hash)
+        .execute(&mut **tx)
+        .await?;
+        accepted += result.rows_affected() as usize;
+        if let Some(update) = update {
             sqlx::query(
                 r#"
                 INSERT INTO threads(thread_id, name, updated_at)
@@ -1265,14 +1346,13 @@ async fn ingest_session_index(
             .bind(update.updated_at)
             .execute(&mut **tx)
             .await?;
-            accepted += 1;
         }
     }
     update_file_cursor(tx, file_id, batch).await?;
     Ok(IngestResponse {
         accepted_lines: accepted,
         indexed_chunks: 0,
-        file_version: current_file_version(tx, file_id).await?,
+        file_version,
         quarantined_lines: 0,
     })
 }
@@ -1302,10 +1382,16 @@ async fn ingest_rollout(
             }
         }
     }
-    let Some(thread_id) = parsed
-        .iter()
-        .find_map(|(_, line)| line.session_metadata().map(|meta| meta.thread_id))
-    else {
+    let Some(thread_id) = resolve_thread_id(tx, file_id, &parsed).await? else {
+        record_ingest_error(
+            tx,
+            batch,
+            file_version,
+            None,
+            "missing_thread_id",
+            "rollout batch did not contain session metadata and file had no known thread id",
+        )
+        .await?;
         update_file_cursor(tx, file_id, batch).await?;
         return Ok(IngestResponse {
             accepted_lines: 0,
@@ -1327,6 +1413,12 @@ async fn ingest_rollout(
     .bind(&thread_id)
     .execute(&mut **tx)
     .await?;
+    sqlx::query("UPDATE rollout_files SET thread_id = $2 WHERE id = $1")
+        .bind(file_id)
+        .bind(&thread_id)
+        .execute(&mut **tx)
+        .await?;
+    apply_rollout_thread_updates(tx, &parsed).await?;
 
     let mut accepted = 0usize;
     for (agent_line, line) in &parsed {
@@ -1462,13 +1554,79 @@ async fn update_file_cursor(
         .max()
         .unwrap_or(0) as i64;
     sqlx::query(
-        "UPDATE rollout_files SET import_byte_cursor = GREATEST(import_byte_cursor, $2), import_line_cursor = GREATEST(import_line_cursor, $3), last_imported_at = now() WHERE id = $1",
+        "UPDATE rollout_files SET import_byte_cursor = GREATEST(import_byte_cursor, $2), import_line_cursor = GREATEST(import_line_cursor, $3), import_schema_version = $4, last_imported_at = now() WHERE id = $1",
     )
     .bind(file_id)
     .bind(max_byte)
     .bind(max_line)
+    .bind(CURRENT_IMPORT_SCHEMA_VERSION)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+async fn resolve_thread_id(
+    tx: &mut Transaction<'_, Postgres>,
+    file_id: i64,
+    parsed: &[(&archive_core::AgentLine, RolloutLine)],
+) -> Result<Option<String>, sqlx::Error> {
+    if let Some(thread_id) = parsed
+        .iter()
+        .find_map(|(_, line)| line.session_metadata().map(|meta| meta.thread_id))
+    {
+        return Ok(Some(thread_id));
+    }
+    let existing =
+        sqlx::query("SELECT thread_id FROM rollout_files WHERE id = $1 AND thread_id IS NOT NULL")
+            .bind(file_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(row) = existing {
+        return Ok(Some(row.get("thread_id")));
+    }
+    let existing = sqlx::query(
+        "SELECT thread_id FROM rollout_lines WHERE file_id = $1 ORDER BY line_number ASC LIMIT 1",
+    )
+    .bind(file_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(existing.map(|row| row.get("thread_id")))
+}
+
+async fn apply_rollout_thread_updates(
+    tx: &mut Transaction<'_, Postgres>,
+    parsed: &[(&archive_core::AgentLine, RolloutLine)],
+) -> Result<(), sqlx::Error> {
+    for (_, line) in parsed {
+        if line.item_type != "event_msg" {
+            continue;
+        }
+        let payload = &line.payload;
+        if payload.get("type").and_then(Value::as_str) != Some("thread_name_updated") {
+            continue;
+        }
+        let Some(thread_id) = payload.get("thread_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(thread_name) = payload.get("thread_name").and_then(Value::as_str) else {
+            continue;
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO threads(thread_id, name, updated_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(thread_id) DO UPDATE SET
+              name = EXCLUDED.name,
+              updated_at = COALESCE(EXCLUDED.updated_at, threads.updated_at),
+              last_seen_at = now()
+            "#,
+        )
+        .bind(thread_id)
+        .bind(thread_name)
+        .bind(line.timestamp)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2545,7 +2703,7 @@ async fn raw_rows(
     let private_filter = if include_private_model_traces {
         "TRUE"
     } else {
-        "NOT (type = 'event_msg' AND payload->>'type' = 'agent_reasoning_raw_content')"
+        "NOT ((type = 'event_msg' AND payload->>'type' = 'agent_reasoning_raw_content') OR (type = 'response_item' AND payload->>'type' = 'reasoning'))"
     };
     let rows = sqlx::query(&format!(
         "SELECT raw FROM rollout_lines WHERE thread_id = $1 AND {private_filter} ORDER BY line_number ASC"
@@ -2838,7 +2996,10 @@ mod tests {
             HeaderValue::from_static("theme=dark; archive_read_token=secret-token; other=1"),
         );
 
-        assert_eq!(cookie_value(&headers, READ_COOKIE_NAME), Some("secret-token"));
+        assert_eq!(
+            cookie_value(&headers, READ_COOKIE_NAME),
+            Some("secret-token")
+        );
         assert_eq!(cookie_value(&headers, "missing"), None);
     }
 }
