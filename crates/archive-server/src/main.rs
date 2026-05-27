@@ -581,12 +581,17 @@ async fn sync_status(
 ) -> Result<Json<Vec<MachineSyncStatus>>, ApiError> {
     require_token(&headers, &state.read_token)?;
     let machines = if let Some(machine_id) = params.machine_id {
-        sqlx::query(
+        if let Some(machine) = sqlx::query(
             "SELECT machine_id, hostname, installation_id, first_seen_at, last_seen_at FROM machines WHERE machine_id = $1",
         )
         .bind(machine_id)
-        .fetch_all(&state.db)
+        .fetch_optional(&state.db)
         .await?
+        {
+            vec![machine]
+        } else {
+            return Ok(Json(Vec::new()));
+        }
     } else {
         sqlx::query(
             "SELECT machine_id, hostname, installation_id, first_seen_at, last_seen_at FROM machines ORDER BY last_seen_at DESC",
@@ -1765,7 +1770,7 @@ async fn machine_sync_status(
     machine: &sqlx::postgres::PgRow,
     machine_id: &str,
 ) -> Result<MachineSyncStatus, ApiError> {
-    let files = sqlx::query(
+    let files_fut = sqlx::query(
         r#"
         SELECT
           count(*) FILTER (WHERE kind = 'active_rollout') AS active_rollout,
@@ -1774,32 +1779,40 @@ async fn machine_sync_status(
           count(*) AS total,
           count(*) FILTER (WHERE relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
                             OR relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today
-        FROM rollout_files WHERE machine_id = $1
+        FROM rollout_files
+        WHERE machine_id = $1
         "#,
     )
     .bind(machine_id)
-    .fetch_one(db)
-    .await?;
-    let content = sqlx::query(
+    .fetch_one(db);
+    let line_counts_fut = sqlx::query(
         r#"
         SELECT
           count(DISTINCT rl.thread_id) AS threads,
-          count(DISTINCT rl.id) AS raw_lines,
-          count(DISTINCT c.id) AS chunks,
-          count(DISTINCT rl.id) FILTER (WHERE rf.relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
-                                         OR rf.relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today_raw_lines,
-          count(DISTINCT c.id) FILTER (WHERE rf.relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
-                                        OR rf.relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today_chunks
-        FROM rollout_files rf
-        LEFT JOIN rollout_lines rl ON rl.file_id = rf.id
-        LEFT JOIN chunks c ON c.file_id = rf.id
+          count(*) AS raw_lines,
+          count(*) FILTER (WHERE rf.relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
+                            OR rf.relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today_raw_lines
+        FROM rollout_lines rl
+        JOIN rollout_files rf ON rf.id = rl.file_id
         WHERE rf.machine_id = $1
         "#,
     )
     .bind(machine_id)
-    .fetch_one(db)
-    .await?;
-    let embeddings = status_counts(
+    .fetch_one(db);
+    let chunk_counts_fut = sqlx::query(
+        r#"
+        SELECT
+          count(*) AS chunks,
+          count(*) FILTER (WHERE rf.relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
+                            OR rf.relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today_chunks
+        FROM chunks c
+        JOIN rollout_files rf ON rf.id = c.file_id
+        WHERE rf.machine_id = $1
+        "#,
+    )
+    .bind(machine_id)
+    .fetch_one(db);
+    let embeddings_fut = status_counts(
         db,
         r#"
         SELECT ej.status AS status, count(*) AS count
@@ -1810,14 +1823,19 @@ async fn machine_sync_status(
         GROUP BY ej.status ORDER BY ej.status
         "#,
         machine_id,
-    )
-    .await?;
-    let ingest_errors = status_counts(
+    );
+    let ingest_errors_fut = status_counts(
         db,
         "SELECT error_kind AS status, count(*) AS count FROM ingest_errors WHERE machine_id = $1 GROUP BY error_kind ORDER BY error_kind",
         machine_id,
-    )
-    .await?;
+    );
+    let (files, line_counts, chunk_counts, embeddings, ingest_errors) = tokio::try_join!(
+        async { Ok::<_, ApiError>(files_fut.await?) },
+        async { Ok::<_, ApiError>(line_counts_fut.await?) },
+        async { Ok::<_, ApiError>(chunk_counts_fut.await?) },
+        embeddings_fut,
+        ingest_errors_fut
+    )?;
     Ok(MachineSyncStatus {
         machine_id: machine_id.to_string(),
         hostname: machine.get("hostname"),
@@ -1832,11 +1850,11 @@ async fn machine_sync_status(
             today: files.get("today"),
         },
         content: SyncContentCounts {
-            threads: content.get("threads"),
-            raw_lines: content.get("raw_lines"),
-            chunks: content.get("chunks"),
-            today_raw_lines: content.get("today_raw_lines"),
-            today_chunks: content.get("today_chunks"),
+            threads: line_counts.get("threads"),
+            raw_lines: line_counts.get("raw_lines"),
+            chunks: chunk_counts.get("chunks"),
+            today_raw_lines: line_counts.get("today_raw_lines"),
+            today_chunks: chunk_counts.get("today_chunks"),
         },
         embeddings,
         ingest_errors,
@@ -1897,6 +1915,7 @@ async fn keyword_search(
     .fetch_all(db)
     .await?;
     Ok(rerank_search_results(
+        query,
         rows.into_iter().map(search_result_from_row).collect(),
         limit,
     ))
@@ -1928,6 +1947,7 @@ async fn semantic_search(
     .fetch_all(&state.db)
     .await?;
     Ok(rerank_search_results(
+        query,
         rows.into_iter().map(search_result_from_row).collect(),
         limit,
     ))
@@ -1984,6 +2004,7 @@ async fn hybrid_search(
     .fetch_all(&state.db)
     .await?;
     Ok(rerank_search_results(
+        query,
         rows.into_iter().map(search_result_from_row).collect(),
         limit,
     ))
@@ -2692,19 +2713,38 @@ fn search_quality_multiplier(result: &SearchResult) -> f64 {
     if text.starts_with("custom_tool_call apply_patch") {
         multiplier *= 0.5;
     }
+    if text.starts_with("Task completed\n") {
+        multiplier *= 0.72;
+    }
+    if text.contains("<subagent_notification>") {
+        multiplier *= 0.22;
+    }
     if text.contains("*** Begin Patch") {
         multiplier *= 0.75;
     }
+    if text.contains("```") || text.contains("Commands I ran:") {
+        multiplier *= 0.68;
+    }
     if text.starts_with("# AGENTS.md instructions") || text.starts_with("<skill>") {
         multiplier *= 0.6;
+    }
+    if result.turn_id.is_none() {
+        multiplier *= 0.88;
     }
 
     multiplier.clamp(0.15, 1.25)
 }
 
-fn rerank_search_results(mut results: Vec<SearchResult>, limit: i64) -> Vec<SearchResult> {
+fn rerank_search_results(
+    query: &str,
+    mut results: Vec<SearchResult>,
+    limit: i64,
+) -> Vec<SearchResult> {
+    let lowered_query = query.to_ascii_lowercase();
+    let query_terms = extract_query_terms(query);
     for result in &mut results {
         result.score *= search_quality_multiplier(result);
+        result.score *= query_quality_multiplier(&lowered_query, &query_terms, result);
     }
     results.sort_by(|left, right| {
         right
@@ -2715,6 +2755,68 @@ fn rerank_search_results(mut results: Vec<SearchResult>, limit: i64) -> Vec<Sear
     });
     results.truncate(limit.max(0) as usize);
     results
+}
+
+fn extract_query_terms(query: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "that", "with", "from", "this", "have", "were", "what", "when", "where",
+        "which", "why", "into", "about", "would", "could", "should", "your", "their", "them",
+        "than", "then", "been", "does", "did", "just", "like", "more",
+    ];
+
+    let mut seen = HashSet::new();
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|part| {
+            let lowered = part.to_ascii_lowercase();
+            if lowered.len() < 4
+                || STOPWORDS.contains(&lowered.as_str())
+                || !seen.insert(lowered.clone())
+            {
+                return None;
+            }
+            Some(lowered)
+        })
+        .collect()
+}
+
+fn query_quality_multiplier(
+    lowered_query: &str,
+    query_terms: &[String],
+    result: &SearchResult,
+) -> f64 {
+    if lowered_query.trim().is_empty() {
+        return 1.0;
+    }
+
+    let lowered_text = result.text.to_ascii_lowercase();
+    let mut multiplier: f64 = 1.0;
+    let overlap = query_terms
+        .iter()
+        .filter(|term| lowered_text.contains(term.as_str()))
+        .count();
+
+    if !query_terms.is_empty() {
+        if overlap == 0 {
+            multiplier *= 0.58;
+        } else if overlap == 1 && query_terms.len() >= 2 {
+            multiplier *= 0.82;
+        } else if overlap == query_terms.len() {
+            multiplier *= 1.05;
+        }
+    }
+
+    if lowered_text.contains(lowered_query) {
+        multiplier *= 1.04;
+    }
+    if lowered_text.contains(&format!("search \"{lowered_query}\""))
+        || lowered_text.contains(&format!("query \"{lowered_query}\""))
+        || lowered_text.contains(&format!("`{lowered_query}`"))
+    {
+        multiplier *= 0.55;
+    }
+
+    multiplier.clamp(0.2, 1.15)
 }
 
 fn collapse_results(results: Vec<SearchResult>, limit: i64) -> Vec<SearchResult> {
@@ -3016,7 +3118,7 @@ mod tests {
         let assistant = SearchResult {
             chunk_id: 2,
             thread_id: "thread".to_string(),
-            turn_id: None,
+            turn_id: Some("turn-1".to_string()),
             chunk_kind: "assistant_message".to_string(),
             role: Some("assistant".to_string()),
             text: "Found the ingestion bug in the batch handoff".to_string(),
@@ -3030,6 +3132,67 @@ mod tests {
 
         assert!(search_quality_multiplier(&patchy_tool) < 0.2);
         assert!(search_quality_multiplier(&assistant) > 1.0);
+    }
+
+    #[test]
+    fn query_quality_penalizes_quoted_search_transcript() {
+        let transcript = SearchResult {
+            chunk_id: 1,
+            thread_id: "thread-a".to_string(),
+            turn_id: None,
+            chunk_kind: "assistant_message".to_string(),
+            role: Some("assistant".to_string()),
+            text: "Commands I ran:\n```bash\npython3 archive_api.py search \"archive completeness\" --mode hybrid\n```".to_string(),
+            score: 1.0,
+            citation: Citation {
+                thread_id: "thread-a".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        let substantive = SearchResult {
+            chunk_id: 2,
+            thread_id: "thread-b".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            chunk_kind: "assistant_message".to_string(),
+            role: Some("assistant".to_string()),
+            text:
+                "We fixed archive completeness by importing archived_sessions into the shared tree."
+                    .to_string(),
+            score: 0.92,
+            citation: Citation {
+                thread_id: "thread-b".to_string(),
+                start_line: 2,
+                end_line: 2,
+            },
+        };
+
+        let reranked = rerank_search_results(
+            "archive completeness",
+            vec![transcript, substantive.clone()],
+            2,
+        );
+        assert_eq!(reranked.first().unwrap().chunk_id, substantive.chunk_id);
+    }
+
+    #[test]
+    fn query_quality_penalizes_subagent_notifications() {
+        let subagent = SearchResult {
+            chunk_id: 1,
+            thread_id: "thread-a".to_string(),
+            turn_id: None,
+            chunk_kind: "user_message".to_string(),
+            role: Some("user".to_string()),
+            text: "<subagent_notification>{\"status\":{\"completed\":\"archive completeness stayed noisy\"}}</subagent_notification>".to_string(),
+            score: 1.0,
+            citation: Citation {
+                thread_id: "thread-a".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+
+        assert!(search_quality_multiplier(&subagent) < 0.3);
     }
 
     #[test]
@@ -3064,7 +3227,11 @@ mod tests {
             },
         };
 
-        let reranked = rerank_search_results(vec![patchy_tool, assistant.clone()], 2);
+        let reranked = rerank_search_results(
+            "completeness issue later rollout batches",
+            vec![patchy_tool, assistant.clone()],
+            2,
+        );
         assert_eq!(reranked.first().unwrap().chunk_id, assistant.chunk_id);
     }
 
