@@ -90,7 +90,8 @@ One-shot import:
 cargo run -p archive-agent -- scan \
   --server http://127.0.0.1:8787 \
   --token "$ARCHIVE_INGEST_TOKEN" \
-  --codex-home ~/.codex
+  --codex-home ~/.codex \
+  --json
 ```
 
 Continuous import:
@@ -103,14 +104,19 @@ cargo run -p archive-agent -- watch \
   --interval-seconds 30
 ```
 
+The agent asks the server for per-file cursors before each scan, skips already-imported files, and uploads only new complete JSONL records for append-only files. Use `--json` for agent-readable progress events or `--quiet` for silence.
+
 ## HTTP
 
 - `POST /v1/ingest/batch`
+- `GET /v1/ingest/cursors?machine_id=...`
+- `GET /v1/sync/status`
+- `POST /v1/embeddings/prioritize`
 - `GET /v1/threads`
 - `GET /v1/threads/{thread_id}`
 - `GET /v1/threads/{thread_id}/raw`
-- `GET /v1/search?q=...&mode=hybrid`
-- `POST /v1/query`
+- `GET /v1/search?q=...&mode=hybrid&scope=decisions`
+- `POST /v1/query` with optional `scope`: `decisions`, `problems`, `commands`, `today`, or `recent`
 - `GET /v1/export`
 - `GET /healthz`
 - `GET /readyz`

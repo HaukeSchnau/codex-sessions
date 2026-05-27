@@ -6,7 +6,8 @@ pub mod rollout;
 pub use chunk::{chunk_rollout_lines, Chunk, ChunkKind};
 pub use hash::{sha256_hex, stable_json_hash};
 pub use ingest::{
-    AgentBatch, AgentFileMetadata, AgentLine, FileKind, IngestResponse, MachineIdentity,
+    AgentBatch, AgentFileMetadata, AgentLine, FileCursor, FileKind, IngestResponse,
+    MachineIdentity, MachineSyncStatus, StatusCount, SyncContentCounts, SyncFileCounts,
 };
 pub use rollout::{
     parse_thread_name_update, RolloutLine, RolloutLineParseError, SessionMetadata, ThreadNameUpdate,

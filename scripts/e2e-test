@@ -70,7 +70,7 @@ jq -e --arg sentinel "$sentinel" '([.raw[].payload.type] | index("agent_reasonin
 raw_private="$(curl -fsS -H "Authorization: Bearer $ARCHIVE_READ_TOKEN" "$base_url/v1/threads/$thread_id/raw?format=json&include_private_model_traces=true")"
 jq -e '[.raw[].payload.type] | index("agent_reasoning_raw_content") != null' <<<"$raw_private" >/dev/null
 
-docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "UPDATE embedding_jobs ej SET status = 'pending', attempts = 0, created_at = now() - interval '1 day', updated_at = now() FROM chunks c WHERE c.id = ej.chunk_id AND c.thread_id = '$thread_id'" >/dev/null
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "UPDATE embedding_jobs ej SET status = 'pending', attempts = 0, created_at = now() + interval '1 day', updated_at = now() FROM chunks c WHERE c.id = ej.chunk_id AND c.thread_id = '$thread_id'" >/dev/null
 
 for _ in $(seq 1 60); do
   status_counts="$(docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT ej.status || ':' || count(*) FROM embedding_jobs ej JOIN chunks c ON c.id = ej.chunk_id WHERE c.thread_id = '$thread_id' GROUP BY ej.status ORDER BY ej.status")"

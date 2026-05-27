@@ -1,10 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Context;
 use archive_core::{
-    chunk_rollout_lines, parse_thread_name_update, AgentBatch, Chunk, FileKind, IngestResponse,
-    RolloutLine,
+    chunk_rollout_lines, parse_thread_name_update, AgentBatch, Chunk, FileCursor, FileKind,
+    IngestResponse, MachineSyncStatus, RolloutLine, StatusCount, SyncContentCounts, SyncFileCounts,
 };
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -103,6 +104,7 @@ struct ThreadListParams {
 struct SearchParams {
     q: String,
     mode: Option<SearchMode>,
+    scope: Option<SearchScope>,
     limit: Option<i64>,
 }
 
@@ -114,7 +116,18 @@ enum SearchMode {
     Hybrid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SearchScope {
+    All,
+    Decisions,
+    Problems,
+    Commands,
+    Today,
+    Recent,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SearchResult {
     chunk_id: i64,
     thread_id: String,
@@ -126,7 +139,7 @@ struct SearchResult {
     citation: Citation,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Citation {
     thread_id: String,
     start_line: i64,
@@ -137,8 +150,33 @@ struct Citation {
 struct QueryRequest {
     query: String,
     mode: Option<SearchMode>,
+    scope: Option<SearchScope>,
     limit: Option<i64>,
     include_raw: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorParams {
+    machine_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncStatusParams {
+    machine_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrioritizeRequest {
+    thread_id: Option<String>,
+    query: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchGroup {
+    thread_id: String,
+    best_score: f64,
+    results: Vec<SearchResult>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +228,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/v1/ingest/batch", post(ingest_batch))
+        .route("/v1/ingest/cursors", get(ingest_cursors))
+        .route("/v1/sync/status", get(sync_status))
+        .route("/v1/embeddings/prioritize", post(prioritize_embeddings))
         .route("/v1/threads", get(list_threads))
         .route("/v1/threads/:thread_id", get(read_thread))
         .route("/v1/threads/:thread_id/raw", get(read_thread_raw))
@@ -254,6 +295,7 @@ async fn ingest_batch(
             accepted_lines: 0,
             indexed_chunks: 0,
             file_version: 1,
+            quarantined_lines: 0,
         }));
     }
 
@@ -269,6 +311,97 @@ async fn ingest_batch(
 
     tx.commit().await?;
     Ok(Json(response))
+}
+
+async fn ingest_cursors(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<CursorParams>,
+) -> Result<Json<Vec<FileCursor>>, ApiError> {
+    require_token(&headers, &state.ingest_token)?;
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT ON (relative_path)
+               relative_path, kind, archived, file_version, size_bytes, modified_at, file_hash, prefix_hash,
+               import_byte_cursor, import_line_cursor
+        FROM rollout_files
+        WHERE machine_id = $1
+        ORDER BY relative_path, file_version DESC
+        "#,
+    )
+    .bind(&params.machine_id)
+    .fetch_all(&state.db)
+    .await?;
+    let cursors = rows
+        .into_iter()
+        .map(|row| FileCursor {
+            relative_path: row.get("relative_path"),
+            kind: file_kind_from_db(row.get::<String, _>("kind").as_str()),
+            archived: row.get("archived"),
+            file_version: row.get("file_version"),
+            size_bytes: row.get::<i64, _>("size_bytes") as u64,
+            modified_at: row.get("modified_at"),
+            file_hash: row.get("file_hash"),
+            prefix_hash: row.get("prefix_hash"),
+            import_byte_cursor: row.get::<i64, _>("import_byte_cursor") as u64,
+            import_line_cursor: row.get("import_line_cursor"),
+        })
+        .collect();
+    Ok(Json(cursors))
+}
+
+async fn sync_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<SyncStatusParams>,
+) -> Result<Json<Vec<MachineSyncStatus>>, ApiError> {
+    require_token(&headers, &state.read_token)?;
+    let machines = if let Some(machine_id) = params.machine_id {
+        sqlx::query(
+            "SELECT machine_id, hostname, installation_id, first_seen_at, last_seen_at FROM machines WHERE machine_id = $1",
+        )
+        .bind(machine_id)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT machine_id, hostname, installation_id, first_seen_at, last_seen_at FROM machines ORDER BY last_seen_at DESC",
+        )
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    let mut statuses = Vec::new();
+    for machine in machines {
+        let machine_id: String = machine.get("machine_id");
+        statuses.push(machine_sync_status(&state.db, &machine, &machine_id).await?);
+    }
+    Ok(Json(statuses))
+}
+
+async fn prioritize_embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PrioritizeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_token(&headers, &state.read_token)?;
+    let limit = request.limit.unwrap_or(200).clamp(1, 1000);
+    let updated = if let Some(thread_id) = request.thread_id {
+        prioritize_thread_embeddings(&state.db, &thread_id).await?
+    } else if let Some(query) = request.query {
+        let results =
+            run_search(&state, &query, SearchMode::Hybrid, SearchScope::All, limit).await?;
+        let mut updated = 0u64;
+        for result in collapse_results(results, limit) {
+            updated += prioritize_thread_embeddings(&state.db, &result.thread_id).await?;
+        }
+        updated
+    } else {
+        return Err(ApiError::BadRequest(
+            "thread_id or query is required".to_string(),
+        ));
+    };
+    Ok(Json(json!({ "prioritized_jobs": updated })))
 }
 
 async fn list_threads(
@@ -346,7 +479,8 @@ async fn read_thread(
     .await?;
     Ok(Json(json!({
         "thread": thread_to_json(&thread),
-        "chunks": chunks.into_iter().map(chunk_to_json).collect::<Vec<_>>()
+        "chunks": chunks.iter().map(chunk_to_json_ref).collect::<Vec<_>>(),
+        "turns": normalized_turns(&chunks),
     })))
 }
 
@@ -397,8 +531,10 @@ async fn search(
         return Err(ApiError::BadRequest("q must not be empty".to_string()));
     }
     let mode = params.mode.unwrap_or(SearchMode::Hybrid);
-    let results = run_search(&state, &params.q, mode, params.limit.unwrap_or(20)).await?;
-    Ok(Json(results))
+    let scope = params.scope.unwrap_or(SearchScope::All);
+    let limit = params.limit.unwrap_or(20);
+    let results = run_search(&state, &params.q, mode, scope, limit * 3).await?;
+    Ok(Json(collapse_results(results, limit)))
 }
 
 async fn query(
@@ -414,9 +550,13 @@ async fn query(
         &state,
         &request.query,
         request.mode.unwrap_or(SearchMode::Hybrid),
-        request.limit.unwrap_or(20),
+        request.scope.unwrap_or(SearchScope::All),
+        request.limit.unwrap_or(20) * 3,
     )
     .await?;
+    let results = collapse_results(results, request.limit.unwrap_or(20));
+    prioritize_result_embeddings(&state.db, &results).await?;
+    let groups = group_results(&results);
     let raw = if request.include_raw.unwrap_or(false) {
         let mut raw = Vec::new();
         for result in &results {
@@ -431,7 +571,9 @@ async fn query(
     } else {
         None
     };
-    Ok(Json(json!({ "results": results, "raw": raw })))
+    Ok(Json(
+        json!({ "results": results, "groups": groups, "raw": raw }),
+    ))
 }
 
 async fn export_jsonl(
@@ -534,6 +676,7 @@ async fn ingest_session_index(
         accepted_lines: accepted,
         indexed_chunks: 0,
         file_version: current_file_version(tx, file_id).await?,
+        quarantined_lines: 0,
     })
 }
 
@@ -543,15 +686,25 @@ async fn ingest_rollout(
 ) -> Result<IngestResponse, ApiError> {
     let file_id = upsert_file(tx, batch).await?;
     let file_version = current_file_version(tx, file_id).await?;
-    let parsed = batch
-        .lines
-        .iter()
-        .filter_map(|line| {
-            RolloutLine::parse(&line.raw)
-                .ok()
-                .map(|rollout| (line, rollout))
-        })
-        .collect::<Vec<_>>();
+    let mut quarantined = 0usize;
+    let mut parsed = Vec::new();
+    for line in &batch.lines {
+        match RolloutLine::parse(&line.raw) {
+            Ok(rollout) => parsed.push((line, rollout)),
+            Err(err) => {
+                record_ingest_error(
+                    tx,
+                    batch,
+                    file_version,
+                    Some(line),
+                    "parse_error",
+                    &err.to_string(),
+                )
+                .await?;
+                quarantined += 1;
+            }
+        }
+    }
     let Some(thread_id) = parsed
         .iter()
         .find_map(|(_, line)| line.session_metadata().map(|meta| meta.thread_id))
@@ -561,6 +714,7 @@ async fn ingest_rollout(
             accepted_lines: 0,
             indexed_chunks: 0,
             file_version,
+            quarantined_lines: quarantined,
         });
     };
 
@@ -614,6 +768,7 @@ async fn ingest_rollout(
         accepted_lines: accepted,
         indexed_chunks: indexed,
         file_version,
+        quarantined_lines: quarantined,
     })
 }
 
@@ -812,23 +967,154 @@ async fn insert_chunks(
     Ok(indexed)
 }
 
+async fn record_ingest_error(
+    tx: &mut Transaction<'_, Postgres>,
+    batch: &AgentBatch,
+    file_version: i32,
+    line: Option<&archive_core::AgentLine>,
+    error_kind: &str,
+    error_message: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO ingest_errors(machine_id, relative_path, file_version, line_number, byte_start, byte_end,
+                                  content_hash, error_kind, error_message, raw_preview)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(&batch.machine.machine_id)
+    .bind(&batch.file.relative_path)
+    .bind(file_version)
+    .bind(line.map(|line| line.line_number))
+    .bind(line.map(|line| line.byte_start as i64))
+    .bind(line.map(|line| line.byte_end as i64))
+    .bind(line.map(|line| line.content_hash.as_str()))
+    .bind(error_kind)
+    .bind(error_message)
+    .bind(line.map(|line| line.raw.chars().take(500).collect::<String>()))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn machine_sync_status(
+    db: &PgPool,
+    machine: &sqlx::postgres::PgRow,
+    machine_id: &str,
+) -> Result<MachineSyncStatus, ApiError> {
+    let files = sqlx::query(
+        r#"
+        SELECT
+          count(*) FILTER (WHERE kind = 'active_rollout') AS active_rollout,
+          count(*) FILTER (WHERE kind = 'archived_rollout') AS archived_rollout,
+          count(*) FILTER (WHERE kind = 'session_index') AS session_index,
+          count(*) AS total,
+          count(*) FILTER (WHERE relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
+                            OR relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today
+        FROM rollout_files WHERE machine_id = $1
+        "#,
+    )
+    .bind(machine_id)
+    .fetch_one(db)
+    .await?;
+    let content = sqlx::query(
+        r#"
+        SELECT
+          count(DISTINCT rl.thread_id) AS threads,
+          count(DISTINCT rl.id) AS raw_lines,
+          count(DISTINCT c.id) AS chunks,
+          count(DISTINCT rl.id) FILTER (WHERE rf.relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
+                                         OR rf.relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today_raw_lines,
+          count(DISTINCT c.id) FILTER (WHERE rf.relative_path LIKE 'sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%'
+                                        OR rf.relative_path LIKE 'archived_sessions/' || to_char(now(), 'YYYY/MM/DD') || '/%') AS today_chunks
+        FROM rollout_files rf
+        LEFT JOIN rollout_lines rl ON rl.file_id = rf.id
+        LEFT JOIN chunks c ON c.file_id = rf.id
+        WHERE rf.machine_id = $1
+        "#,
+    )
+    .bind(machine_id)
+    .fetch_one(db)
+    .await?;
+    let embeddings = status_counts(
+        db,
+        r#"
+        SELECT ej.status AS status, count(*) AS count
+        FROM embedding_jobs ej
+        JOIN chunks c ON c.id = ej.chunk_id
+        JOIN rollout_files rf ON rf.id = c.file_id
+        WHERE rf.machine_id = $1
+        GROUP BY ej.status ORDER BY ej.status
+        "#,
+        machine_id,
+    )
+    .await?;
+    let ingest_errors = status_counts(
+        db,
+        "SELECT error_kind AS status, count(*) AS count FROM ingest_errors WHERE machine_id = $1 GROUP BY error_kind ORDER BY error_kind",
+        machine_id,
+    )
+    .await?;
+    Ok(MachineSyncStatus {
+        machine_id: machine_id.to_string(),
+        hostname: machine.get("hostname"),
+        installation_id: machine.get("installation_id"),
+        first_seen_at: machine.get("first_seen_at"),
+        last_seen_at: machine.get("last_seen_at"),
+        files: SyncFileCounts {
+            active_rollout: files.get("active_rollout"),
+            archived_rollout: files.get("archived_rollout"),
+            session_index: files.get("session_index"),
+            total: files.get("total"),
+            today: files.get("today"),
+        },
+        content: SyncContentCounts {
+            threads: content.get("threads"),
+            raw_lines: content.get("raw_lines"),
+            chunks: content.get("chunks"),
+            today_raw_lines: content.get("today_raw_lines"),
+            today_chunks: content.get("today_chunks"),
+        },
+        embeddings,
+        ingest_errors,
+    })
+}
+
+async fn status_counts(
+    db: &PgPool,
+    sql: &str,
+    machine_id: &str,
+) -> Result<Vec<StatusCount>, ApiError> {
+    let rows = sqlx::query(sql).bind(machine_id).fetch_all(db).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| StatusCount {
+            status: row.get("status"),
+            count: row.get("count"),
+        })
+        .collect())
+}
+
 async fn run_search(
     state: &AppState,
     query: &str,
     mode: SearchMode,
+    scope: SearchScope,
     limit: i64,
 ) -> Result<Vec<SearchResult>, ApiError> {
     let limit = limit.clamp(1, 100);
     match mode {
-        SearchMode::Keyword => keyword_search(&state.db, query, limit).await,
-        SearchMode::Semantic => semantic_search(state, query, limit).await,
-        SearchMode::Hybrid => hybrid_search(state, query, limit).await,
+        SearchMode::Keyword => keyword_search(&state.db, query, scope, limit).await,
+        SearchMode::Semantic => semantic_search(state, query, scope, limit).await,
+        SearchMode::Hybrid => hybrid_search(state, query, scope, limit).await,
     }
 }
 
 async fn keyword_search(
     db: &PgPool,
     query: &str,
+    scope: SearchScope,
     limit: i64,
 ) -> Result<Vec<SearchResult>, ApiError> {
     let rows = sqlx::query(
@@ -837,11 +1123,13 @@ async fn keyword_search(
                ts_rank_cd(search_tsv, plainto_tsquery('simple', $1))::float8 AS score
         FROM chunks
         WHERE search_tsv @@ plainto_tsquery('simple', $1)
+          AND search_scope_matches($2, chunk_kind, role, text, created_at)
         ORDER BY score DESC, id DESC
-        LIMIT $2
+        LIMIT $3
         "#,
     )
     .bind(query)
+    .bind(search_scope_name(scope))
     .bind(limit)
     .fetch_all(db)
     .await?;
@@ -851,6 +1139,7 @@ async fn keyword_search(
 async fn semantic_search(
     state: &AppState,
     query: &str,
+    scope: SearchScope,
     limit: i64,
 ) -> Result<Vec<SearchResult>, ApiError> {
     let embedding = embed_text(state, query).await?;
@@ -861,11 +1150,13 @@ async fn semantic_search(
                (1 - (embedding <=> $1::vector))::float8 AS score
         FROM chunks
         WHERE embedding IS NOT NULL
+          AND search_scope_matches($2, chunk_kind, role, text, created_at)
         ORDER BY embedding <=> $1::vector
-        LIMIT $2
+        LIMIT $3
         "#,
     )
     .bind(vector)
+    .bind(search_scope_name(scope))
     .bind(limit)
     .fetch_all(&state.db)
     .await?;
@@ -875,10 +1166,11 @@ async fn semantic_search(
 async fn hybrid_search(
     state: &AppState,
     query: &str,
+    scope: SearchScope,
     limit: i64,
 ) -> Result<Vec<SearchResult>, ApiError> {
     if state.openai_api_key.is_empty() {
-        return keyword_search(&state.db, query, limit).await;
+        return keyword_search(&state.db, query, scope, limit).await;
     }
     let embedding = embed_text(state, query).await?;
     let vector = vector_literal(&embedding);
@@ -888,13 +1180,15 @@ async fn hybrid_search(
           SELECT id, row_number() OVER (ORDER BY ts_rank_cd(search_tsv, plainto_tsquery('simple', $1)) DESC) AS rank
           FROM chunks
           WHERE search_tsv @@ plainto_tsquery('simple', $1)
-          LIMIT $3
+            AND search_scope_matches($3, chunk_kind, role, text, created_at)
+          LIMIT $4
         ),
         semantic AS (
           SELECT id, row_number() OVER (ORDER BY embedding <=> $2::vector) AS rank
           FROM chunks
           WHERE embedding IS NOT NULL
-          LIMIT $3
+            AND search_scope_matches($3, chunk_kind, role, text, created_at)
+          LIMIT $4
         ),
         fused AS (
           SELECT id, SUM(score)::float8 AS score
@@ -909,11 +1203,12 @@ async fn hybrid_search(
         FROM fused
         JOIN chunks c ON c.id = fused.id
         ORDER BY fused.score DESC, c.id DESC
-        LIMIT $3
+        LIMIT $4
         "#,
     )
     .bind(query)
     .bind(vector)
+    .bind(search_scope_name(scope))
     .bind(limit)
     .fetch_all(&state.db)
     .await?;
@@ -981,7 +1276,7 @@ async fn run_embedding_once(state: &AppState) -> Result<(), ApiError> {
         WHERE chunk_id IN (
           SELECT chunk_id FROM embedding_jobs
           WHERE status IN ('pending', 'failed') AND attempts < 5
-          ORDER BY created_at ASC LIMIT 8
+          ORDER BY created_at DESC, chunk_id ASC LIMIT 8
         )
         RETURNING chunk_id
         "#,
@@ -1028,6 +1323,38 @@ async fn run_embedding_once(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
+async fn prioritize_thread_embeddings(db: &PgPool, thread_id: &str) -> Result<u64, ApiError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE embedding_jobs ej
+        SET status = CASE WHEN status = 'failed' THEN 'pending' ELSE status END,
+            created_at = now() + interval '1 day',
+            updated_at = now()
+        FROM chunks c
+        WHERE c.id = ej.chunk_id
+          AND c.thread_id = $1
+          AND ej.status IN ('pending', 'failed')
+        "#,
+    )
+    .bind(thread_id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+async fn prioritize_result_embeddings(
+    db: &PgPool,
+    results: &[SearchResult],
+) -> Result<(), ApiError> {
+    let mut seen = HashSet::new();
+    for result in results {
+        if seen.insert(result.thread_id.clone()) {
+            prioritize_thread_embeddings(db, &result.thread_id).await?;
+        }
+    }
+    Ok(())
+}
+
 fn vector_literal(values: &[f32]) -> String {
     let inner = values
         .iter()
@@ -1035,6 +1362,66 @@ fn vector_literal(values: &[f32]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{inner}]")
+}
+
+fn search_scope_name(scope: SearchScope) -> &'static str {
+    match scope {
+        SearchScope::All => "all",
+        SearchScope::Decisions => "decisions",
+        SearchScope::Problems => "problems",
+        SearchScope::Commands => "commands",
+        SearchScope::Today => "today",
+        SearchScope::Recent => "recent",
+    }
+}
+
+fn collapse_results(results: Vec<SearchResult>, limit: i64) -> Vec<SearchResult> {
+    let mut seen = HashSet::new();
+    let mut collapsed = Vec::new();
+    for result in results {
+        let normalized = result
+            .text
+            .split_whitespace()
+            .take(80)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let key = (
+            result.thread_id.clone(),
+            result.chunk_kind.clone(),
+            normalized,
+        );
+        if seen.insert(key) {
+            collapsed.push(result);
+        }
+        if collapsed.len() >= limit as usize {
+            break;
+        }
+    }
+    collapsed
+}
+
+fn group_results(results: &[SearchResult]) -> Vec<SearchGroup> {
+    let mut groups: Vec<SearchGroup> = Vec::new();
+    let mut indexes: HashMap<String, usize> = HashMap::new();
+    for result in results {
+        if let Some(index) = indexes.get(&result.thread_id).copied() {
+            groups[index].best_score = groups[index].best_score.max(result.score);
+            groups[index].results.push(result.clone());
+        } else {
+            indexes.insert(result.thread_id.clone(), groups.len());
+            groups.push(SearchGroup {
+                thread_id: result.thread_id.clone(),
+                best_score: result.score,
+                results: vec![result.clone()],
+            });
+        }
+    }
+    groups.sort_by(|a, b| {
+        b.best_score
+            .partial_cmp(&a.best_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    groups
 }
 
 async fn raw_rows(
@@ -1105,6 +1492,14 @@ fn sanitize_json_for_postgres(value: &mut Value) {
     }
 }
 
+fn file_kind_from_db(kind: &str) -> FileKind {
+    match kind {
+        "archived_rollout" => FileKind::ArchivedRollout,
+        "session_index" => FileKind::SessionIndex,
+        _ => FileKind::ActiveRollout,
+    }
+}
+
 fn thread_summary_from_row(row: sqlx::postgres::PgRow) -> ThreadSummary {
     ThreadSummary {
         thread_id: row.get("thread_id"),
@@ -1161,7 +1556,7 @@ fn thread_to_json(row: &sqlx::postgres::PgRow) -> Value {
     })
 }
 
-fn chunk_to_json(row: sqlx::postgres::PgRow) -> Value {
+fn chunk_to_json_ref(row: &sqlx::postgres::PgRow) -> Value {
     json!({
         "chunk_id": row.get::<i64, _>("id"),
         "turn_id": row.get::<Option<String>, _>("turn_id"),
@@ -1172,6 +1567,40 @@ fn chunk_to_json(row: sqlx::postgres::PgRow) -> Value {
         "end_line": row.get::<i64, _>("end_line"),
         "metadata": row.get::<Value, _>("metadata"),
     })
+}
+
+fn normalized_turns(rows: &[sqlx::postgres::PgRow]) -> Vec<Value> {
+    let mut turns: Vec<Value> = Vec::new();
+    let mut indexes: HashMap<String, usize> = HashMap::new();
+    for row in rows {
+        let turn_id = row
+            .get::<Option<String>, _>("turn_id")
+            .unwrap_or_else(|| "unassigned".to_string());
+        let chunk = chunk_to_json_ref(row);
+        if let Some(index) = indexes.get(&turn_id).copied() {
+            turns[index]["chunks"].as_array_mut().unwrap().push(chunk);
+        } else {
+            indexes.insert(turn_id.clone(), turns.len());
+            turns.push(json!({
+                "turn_id": turn_id,
+                "start_line": row.get::<i64, _>("start_line"),
+                "end_line": row.get::<i64, _>("end_line"),
+                "chunks": [chunk],
+            }));
+        }
+    }
+    for turn in &mut turns {
+        if let Some(chunks) = turn["chunks"].as_array() {
+            let end_line = chunks
+                .iter()
+                .filter_map(|chunk| chunk["end_line"].as_i64())
+                .max();
+            if let Some(end_line) = end_line {
+                turn["end_line"] = json!(end_line);
+            }
+        }
+    }
+    turns
 }
 
 #[cfg(test)]

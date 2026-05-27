@@ -49,4 +49,58 @@ pub struct IngestResponse {
     pub accepted_lines: usize,
     pub indexed_chunks: usize,
     pub file_version: i32,
+    #[serde(default)]
+    pub quarantined_lines: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileCursor {
+    pub relative_path: String,
+    pub kind: FileKind,
+    pub file_version: i32,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<DateTime<Utc>>,
+    pub file_hash: String,
+    pub prefix_hash: String,
+    pub import_byte_cursor: u64,
+    pub import_line_cursor: i64,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineSyncStatus {
+    pub machine_id: String,
+    pub hostname: String,
+    pub installation_id: Option<String>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub files: SyncFileCounts,
+    pub content: SyncContentCounts,
+    pub embeddings: Vec<StatusCount>,
+    pub ingest_errors: Vec<StatusCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncFileCounts {
+    pub active_rollout: i64,
+    pub archived_rollout: i64,
+    pub session_index: i64,
+    pub total: i64,
+    pub today: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncContentCounts {
+    pub threads: i64,
+    pub raw_lines: i64,
+    pub chunks: i64,
+    pub today_raw_lines: i64,
+    pub today_chunks: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusCount {
+    pub status: String,
+    pub count: i64,
 }
