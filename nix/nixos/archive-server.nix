@@ -84,19 +84,19 @@ in
 
     secrets = {
       ingestTokenFile = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
+        type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
         default = null;
         description = "Path to a file containing the bearer token accepted for ingestion.";
       };
 
       readTokenFile = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
+        type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
         default = null;
         description = "Path to a file containing the bearer token accepted for read/query APIs.";
       };
 
       openaiApiKeyFile = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
+        type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
         default = null;
         description = "Path to a file containing OPENAI_API_KEY.";
       };

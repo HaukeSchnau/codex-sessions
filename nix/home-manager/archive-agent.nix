@@ -38,7 +38,7 @@ in
     };
 
     ingestTokenFile = lib.mkOption {
-      type = lib.types.path;
+      type = lib.types.either lib.types.path lib.types.str;
       description = "Path to a file containing the ingestion bearer token.";
     };
 
