@@ -7,13 +7,13 @@ use archive_core::{
     chunk_rollout_lines, parse_thread_name_update, AgentBatch, Chunk, FileCursor, FileKind,
     IngestResponse, MachineSyncStatus, RolloutLine, StatusCount, SyncContentCounts, SyncFileCounts,
 };
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use reqwest::multipart::{Form, Part};
+use reqwest::multipart::{Form as MultipartForm, Part};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +22,8 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
+
+const READ_COOKIE_NAME: &str = "archive_read_token";
 
 #[derive(Clone)]
 struct AppState {
@@ -114,6 +116,13 @@ struct ThreadListParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct UiThreadListParams {
+    q: Option<String>,
+    archived: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SearchParams {
     q: String,
     mode: Option<SearchMode>,
@@ -121,7 +130,25 @@ struct SearchParams {
     limit: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Deserialize)]
+struct UiSearchParams {
+    q: Option<String>,
+    mode: Option<SearchMode>,
+    scope: Option<SearchScope>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UiLoginQuery {
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UiLoginForm {
+    token: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SearchMode {
     Keyword,
@@ -129,7 +156,7 @@ enum SearchMode {
     Hybrid,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SearchScope {
     All,
@@ -302,6 +329,11 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/ui", get(ui_threads))
+        .route("/ui/login", get(ui_login).post(ui_login_submit))
+        .route("/ui/logout", post(ui_logout))
+        .route("/ui/search", get(ui_search))
+        .route("/ui/threads/:thread_id", get(ui_thread))
         .route("/v1/ingest/batch", post(ingest_batch))
         .route("/v1/ingest/cursors", get(ingest_cursors))
         .route("/v1/sync/status", get(sync_status))
@@ -384,6 +416,94 @@ async fn healthz() -> &'static str {
 async fn readyz(State(state): State<AppState>) -> Result<&'static str, ApiError> {
     sqlx::query("SELECT 1").execute(&state.db).await?;
     Ok("ok")
+}
+
+async fn ui_login(Query(params): Query<UiLoginQuery>) -> Html<String> {
+    render_login_page(params.error.as_deref())
+}
+
+async fn ui_login_submit(State(state): State<AppState>, Form(form): Form<UiLoginForm>) -> Response {
+    if form.token.trim() != state.read_token {
+        return (
+            StatusCode::UNAUTHORIZED,
+            render_login_page(Some("That token did not match the archive read token.")),
+        )
+            .into_response();
+    }
+    let mut response = Redirect::to("/ui").into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&auth_cookie(&state.read_token)).unwrap(),
+    );
+    response
+}
+
+async fn ui_logout() -> Response {
+    let mut response = Redirect::to("/ui/login").into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("archive_read_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
+    response
+}
+
+async fn ui_threads(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<UiThreadListParams>,
+) -> Result<Response, ApiError> {
+    if !has_read_access(&headers, &state.read_token) {
+        return Ok(Redirect::to("/ui/login").into_response());
+    }
+    let api_params = ThreadListParams {
+        q: params.q.clone(),
+        cwd: None,
+        source: None,
+        machine: None,
+        model: None,
+        git_branch: None,
+        archived: match params.archived.as_deref() {
+            Some("active") => Some(false),
+            Some("only") => Some(true),
+            _ => None,
+        },
+        limit: params.limit,
+        offset: None,
+    };
+    let threads = fetch_threads(&state.db, &api_params).await?;
+    Ok(render_threads_page(&params, &threads).into_response())
+}
+
+async fn ui_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<UiSearchParams>,
+) -> Result<Response, ApiError> {
+    if !has_read_access(&headers, &state.read_token) {
+        return Ok(Redirect::to("/ui/login").into_response());
+    }
+    let mut results = Vec::new();
+    let query = params.q.as_deref().unwrap_or("").trim().to_string();
+    if !query.is_empty() {
+        let mode = params.mode.unwrap_or(SearchMode::Hybrid);
+        let scope = params.scope.unwrap_or(SearchScope::All);
+        let limit = params.limit.unwrap_or(20);
+        let search_results = run_search(&state, &query, mode, scope, limit * 3).await?;
+        results = collapse_results(search_results, limit);
+    }
+    Ok(render_search_page(&params, &results).into_response())
+}
+
+async fn ui_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(thread_id): Path<String>,
+) -> Result<Response, ApiError> {
+    if !has_read_access(&headers, &state.read_token) {
+        return Ok(Redirect::to("/ui/login").into_response());
+    }
+    let (thread, chunks) = fetch_thread_and_chunks(&state.db, &thread_id).await?;
+    Ok(render_thread_page(&thread, &chunks).into_response())
 }
 
 async fn ingest_batch(
@@ -511,52 +631,8 @@ async fn list_threads(
     headers: HeaderMap,
     Query(params): Query<ThreadListParams>,
 ) -> Result<Json<Vec<ThreadSummary>>, ApiError> {
-    require_token(&headers, &state.read_token)?;
-    let limit = params.limit.unwrap_or(50).clamp(1, 200);
-    let offset = params.offset.unwrap_or(0).max(0);
-    let archived_filter = match params.archived {
-        Some(true) => "t.archived_at IS NOT NULL",
-        Some(false) => "t.archived_at IS NULL",
-        None => "TRUE",
-    };
-
-    let rows = sqlx::query(&format!(
-        r#"
-        SELECT DISTINCT t.thread_id, t.name, preview.text AS preview, t.cwd, t.source,
-               t.model_provider, t.model, t.git_branch, t.created_at, t.updated_at, t.archived_at
-        FROM threads t
-        LEFT JOIN LATERAL (
-          SELECT c.text FROM chunks c
-          WHERE c.thread_id = t.thread_id
-          ORDER BY c.start_line ASC LIMIT 1
-        ) preview ON TRUE
-        LEFT JOIN rollout_lines rl ON rl.thread_id = t.thread_id
-        LEFT JOIN rollout_files rf ON rf.id = rl.file_id
-        WHERE {archived_filter}
-          AND ($1::TEXT IS NULL OR t.cwd ILIKE '%' || $1 || '%')
-          AND ($2::TEXT IS NULL OR t.source = $2)
-          AND ($3::TEXT IS NULL OR rf.machine_id = $3)
-          AND ($4::TEXT IS NULL OR t.model = $4 OR t.model_provider = $4)
-          AND ($5::TEXT IS NULL OR t.git_branch = $5)
-          AND ($6::TEXT IS NULL OR t.name ILIKE '%' || $6 || '%' OR preview.text ILIKE '%' || $6 || '%')
-        ORDER BY t.updated_at DESC NULLS LAST, t.created_at DESC NULLS LAST
-        LIMIT $7 OFFSET $8
-        "#
-    ))
-    .bind(params.cwd)
-    .bind(params.source)
-    .bind(params.machine)
-    .bind(params.model)
-    .bind(params.git_branch)
-    .bind(params.q)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.db)
-    .await?;
-
-    Ok(Json(
-        rows.into_iter().map(thread_summary_from_row).collect(),
-    ))
+    require_read_access(&headers, &state.read_token)?;
+    Ok(Json(fetch_threads(&state.db, &params).await?))
 }
 
 async fn read_thread(
@@ -564,21 +640,8 @@ async fn read_thread(
     headers: HeaderMap,
     Path(thread_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    require_token(&headers, &state.read_token)?;
-    let thread = sqlx::query("SELECT * FROM threads WHERE thread_id = $1")
-        .bind(&thread_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let chunks = sqlx::query(
-        r#"
-        SELECT id, turn_id, chunk_kind, role, text, start_line, end_line, metadata
-        FROM chunks WHERE thread_id = $1 ORDER BY start_line ASC, id ASC
-        "#,
-    )
-    .bind(&thread_id)
-    .fetch_all(&state.db)
-    .await?;
+    require_read_access(&headers, &state.read_token)?;
+    let (thread, chunks) = fetch_thread_and_chunks(&state.db, &thread_id).await?;
     Ok(Json(json!({
         "thread": thread_to_json(&thread),
         "chunks": chunks.iter().map(chunk_to_json_ref).collect::<Vec<_>>(),
@@ -592,7 +655,7 @@ async fn read_thread_raw(
     Path(thread_id): Path<String>,
     Query(params): Query<RawParams>,
 ) -> Result<Response, ApiError> {
-    require_token(&headers, &state.read_token)?;
+    require_read_access(&headers, &state.read_token)?;
     let rows = raw_rows(
         &state.db,
         &thread_id,
@@ -628,7 +691,7 @@ async fn search(
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<Vec<SearchResult>>, ApiError> {
-    require_token(&headers, &state.read_token)?;
+    require_read_access(&headers, &state.read_token)?;
     if params.q.trim().is_empty() {
         return Err(ApiError::BadRequest("q must not be empty".to_string()));
     }
@@ -644,7 +707,7 @@ async fn query(
     headers: HeaderMap,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    require_token(&headers, &state.read_token)?;
+    require_read_access(&headers, &state.read_token)?;
     if request.query.trim().is_empty() {
         return Err(ApiError::BadRequest("query must not be empty".to_string()));
     }
@@ -682,7 +745,7 @@ async fn export_jsonl(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    require_token(&headers, &state.read_token)?;
+    require_read_access(&headers, &state.read_token)?;
     let rows = sqlx::query(
         r#"
         SELECT t.thread_id, t.name, t.cwd, t.source, t.model_provider, t.model,
@@ -723,6 +786,438 @@ async fn export_jsonl(
         body,
     )
         .into_response())
+}
+
+async fn fetch_threads(
+    db: &PgPool,
+    params: &ThreadListParams,
+) -> Result<Vec<ThreadSummary>, ApiError> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let archived_filter = match params.archived {
+        Some(true) => "t.archived_at IS NOT NULL",
+        Some(false) => "t.archived_at IS NULL",
+        None => "TRUE",
+    };
+
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT DISTINCT t.thread_id, t.name, preview.text AS preview, t.cwd, t.source,
+               t.model_provider, t.model, t.git_branch, t.created_at, t.updated_at, t.archived_at
+        FROM threads t
+        LEFT JOIN LATERAL (
+          SELECT c.text FROM chunks c
+          WHERE c.thread_id = t.thread_id
+          ORDER BY c.start_line ASC LIMIT 1
+        ) preview ON TRUE
+        LEFT JOIN rollout_lines rl ON rl.thread_id = t.thread_id
+        LEFT JOIN rollout_files rf ON rf.id = rl.file_id
+        WHERE {archived_filter}
+          AND ($1::TEXT IS NULL OR t.cwd ILIKE '%' || $1 || '%')
+          AND ($2::TEXT IS NULL OR t.source = $2)
+          AND ($3::TEXT IS NULL OR rf.machine_id = $3)
+          AND ($4::TEXT IS NULL OR t.model = $4 OR t.model_provider = $4)
+          AND ($5::TEXT IS NULL OR t.git_branch = $5)
+          AND ($6::TEXT IS NULL OR t.name ILIKE '%' || $6 || '%' OR preview.text ILIKE '%' || $6 || '%')
+        ORDER BY t.updated_at DESC NULLS LAST, t.created_at DESC NULLS LAST
+        LIMIT $7 OFFSET $8
+        "#
+    ))
+    .bind(&params.cwd)
+    .bind(&params.source)
+    .bind(&params.machine)
+    .bind(&params.model)
+    .bind(&params.git_branch)
+    .bind(&params.q)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows.into_iter().map(thread_summary_from_row).collect())
+}
+
+async fn fetch_thread_and_chunks(
+    db: &PgPool,
+    thread_id: &str,
+) -> Result<(sqlx::postgres::PgRow, Vec<sqlx::postgres::PgRow>), ApiError> {
+    let thread = sqlx::query("SELECT * FROM threads WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let chunks = sqlx::query(
+        r#"
+        SELECT id, turn_id, chunk_kind, role, text, start_line, end_line, metadata
+        FROM chunks WHERE thread_id = $1 ORDER BY start_line ASC, id ASC
+        "#,
+    )
+    .bind(thread_id)
+    .fetch_all(db)
+    .await?;
+    Ok((thread, chunks))
+}
+
+fn render_login_page(error: Option<&str>) -> Html<String> {
+    let error_html = error
+        .map(|message| format!("<p class=\"error\">{}</p>", html_escape(message)))
+        .unwrap_or_default();
+    render_page(
+        "Codex Archive Login",
+        &format!(
+            r#"
+            <section>
+              <h1>Codex Archive</h1>
+              <p class="muted">Enter the archive read token to browse threads in a plain old web page.</p>
+              {error_html}
+              <form method="post" action="/ui/login" class="stack">
+                <label for="token">Read token</label>
+                <input id="token" name="token" type="password" autocomplete="current-password" required />
+                <button type="submit">Open archive</button>
+              </form>
+            </section>
+            "#
+        ),
+    )
+}
+
+fn render_threads_page(params: &UiThreadListParams, threads: &[ThreadSummary]) -> Html<String> {
+    let archived_value = params.archived.as_deref().unwrap_or("all");
+    let mut items = String::new();
+    for thread in threads {
+        let title = thread
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&thread.thread_id);
+        let preview = truncate_text(thread.preview.as_deref().unwrap_or(""), 220);
+        let updated = fmt_ts(thread.updated_at.or(thread.created_at));
+        let archived = if thread.archived_at.is_some() {
+            "<span class=\"badge\">archived</span>"
+        } else {
+            ""
+        };
+        items.push_str(&format!(
+            r#"<li>
+              <a href="/ui/threads/{thread_id}"><strong>{title}</strong></a> {archived}
+              <div class="meta">{updated} · {model} · {cwd}</div>
+              <p>{preview}</p>
+            </li>"#,
+            thread_id = html_escape(&thread.thread_id),
+            title = html_escape(title),
+            archived = archived,
+            updated = html_escape(&updated),
+            model = html_escape(display_str(
+                thread.model.as_deref().or(thread.model_provider.as_deref())
+            )),
+            cwd = html_escape(display_str(thread.cwd.as_deref())),
+            preview = html_escape(&preview),
+        ));
+    }
+    if items.is_empty() {
+        items.push_str("<li><p class=\"muted\">No threads matched that filter.</p></li>");
+    }
+    render_page(
+        "Codex Archive Threads",
+        &format!(
+            r#"
+            {nav_html}
+            <section>
+              <h1>Threads</h1>
+              <form method="get" action="/ui" class="stack compact">
+                <label>Text
+                  <input type="text" name="q" value="{q}" />
+                </label>
+                <label>Archived
+                  <select name="archived">
+                    <option value="all"{all_selected}>All</option>
+                    <option value="active"{active_selected}>Active only</option>
+                    <option value="only"{only_selected}>Archived only</option>
+                  </select>
+                </label>
+                <label>Limit
+                  <input type="number" min="1" max="200" name="limit" value="{limit}" />
+                </label>
+                <button type="submit">Filter threads</button>
+              </form>
+              <ul class="list">{items}</ul>
+            </section>
+            "#,
+            nav_html = render_nav("/ui", None),
+            q = html_escape(params.q.as_deref().unwrap_or("")),
+            all_selected = selected_attr(archived_value == "all"),
+            active_selected = selected_attr(archived_value == "active"),
+            only_selected = selected_attr(archived_value == "only"),
+            limit = params.limit.unwrap_or(50).clamp(1, 200),
+            items = items,
+        ),
+    )
+}
+
+fn render_search_page(params: &UiSearchParams, results: &[SearchResult]) -> Html<String> {
+    let mut items = String::new();
+    for result in results {
+        let text = truncate_text(&result.text, 360);
+        items.push_str(&format!(
+            r#"<li>
+              <a href="/ui/threads/{thread_id}#chunk-{chunk_id}"><strong>{thread_id}</strong></a>
+              <div class="meta">{chunk_kind} · {role} · lines {start_line}-{end_line} · score {score:.3}</div>
+              <p>{text}</p>
+            </li>"#,
+            thread_id = html_escape(&result.thread_id),
+            chunk_id = result.chunk_id,
+            chunk_kind = html_escape(&result.chunk_kind),
+            role = html_escape(display_str(result.role.as_deref())),
+            start_line = result.citation.start_line,
+            end_line = result.citation.end_line,
+            score = result.score,
+            text = html_escape(&text),
+        ));
+    }
+    if params.q.as_deref().unwrap_or("").trim().is_empty() {
+        items.push_str(
+            "<li><p class=\"muted\">Search for a term, command, decision, or bug thread.</p></li>",
+        );
+    } else if items.is_empty() {
+        items.push_str("<li><p class=\"muted\">No results for that query.</p></li>");
+    }
+    render_page(
+        "Codex Archive Search",
+        &format!(
+            r#"
+            {nav_html}
+            <section>
+              <h1>Search</h1>
+              <form method="get" action="/ui/search" class="stack compact">
+                <label>Query
+                  <input type="text" name="q" value="{q}" required />
+                </label>
+                <label>Mode
+                  <select name="mode">
+                    <option value="hybrid"{hybrid}>Hybrid</option>
+                    <option value="keyword"{keyword}>Keyword</option>
+                    <option value="semantic"{semantic}>Semantic</option>
+                  </select>
+                </label>
+                <label>Scope
+                  <select name="scope">
+                    {scope_options}
+                  </select>
+                </label>
+                <label>Limit
+                  <input type="number" min="1" max="100" name="limit" value="{limit}" />
+                </label>
+                <button type="submit">Search</button>
+              </form>
+              <ul class="list">{items}</ul>
+            </section>
+            "#,
+            nav_html = render_nav("/ui/search", params.q.as_deref()),
+            q = html_escape(params.q.as_deref().unwrap_or("")),
+            hybrid = selected_attr(params.mode.unwrap_or(SearchMode::Hybrid) == SearchMode::Hybrid),
+            keyword = selected_attr(params.mode == Some(SearchMode::Keyword)),
+            semantic = selected_attr(params.mode == Some(SearchMode::Semantic)),
+            scope_options = render_scope_options(params.scope.unwrap_or(SearchScope::All)),
+            limit = params.limit.unwrap_or(20).clamp(1, 100),
+            items = items,
+        ),
+    )
+}
+
+fn render_thread_page(
+    thread: &sqlx::postgres::PgRow,
+    chunks: &[sqlx::postgres::PgRow],
+) -> Html<String> {
+    let thread_id = thread.get::<String, _>("thread_id");
+    let name = thread.get::<Option<String>, _>("name");
+    let model = thread.get::<Option<String>, _>("model");
+    let model_provider = thread.get::<Option<String>, _>("model_provider");
+    let cwd = thread.get::<Option<String>, _>("cwd");
+    let git_branch = thread.get::<Option<String>, _>("git_branch");
+    let updated_at = thread.get::<Option<DateTime<Utc>>, _>("updated_at");
+    let created_at = thread.get::<Option<DateTime<Utc>>, _>("created_at");
+    let title = name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| thread_id.clone());
+    let raw_json = format!("/v1/threads/{thread_id}/raw?format=json");
+    let raw_jsonl = format!("/v1/threads/{thread_id}/raw?format=jsonl");
+    let mut chunk_html = String::new();
+    for chunk in chunks {
+        let chunk_id = chunk.get::<i64, _>("id");
+        let text = chunk.get::<String, _>("text");
+        let role = chunk.get::<Option<String>, _>("role");
+        let kind = chunk.get::<String, _>("chunk_kind");
+        let start_line = chunk.get::<i64, _>("start_line");
+        let end_line = chunk.get::<i64, _>("end_line");
+        chunk_html.push_str(&format!(
+            r#"<article id="chunk-{chunk_id}" class="chunk">
+                <div class="meta">{kind} · {role} · lines {start_line}-{end_line}</div>
+                <pre>{text}</pre>
+              </article>"#,
+            chunk_id = chunk_id,
+            kind = html_escape(&kind),
+            role = html_escape(display_str(role.as_deref())),
+            start_line = start_line,
+            end_line = end_line,
+            text = html_escape(&text),
+        ));
+    }
+    if chunk_html.is_empty() {
+        chunk_html.push_str("<p class=\"muted\">No chunks indexed for this thread yet.</p>");
+    }
+    render_page(
+        &format!("Codex Thread {title}"),
+        &format!(
+            r#"
+            {nav_html}
+            <section>
+              <h1>{title}</h1>
+              <dl class="facts">
+                <dt>Thread ID</dt><dd>{thread_id}</dd>
+                <dt>Updated</dt><dd>{updated}</dd>
+                <dt>Model</dt><dd>{model}</dd>
+                <dt>CWD</dt><dd>{cwd}</dd>
+                <dt>Git branch</dt><dd>{git_branch}</dd>
+              </dl>
+              <p><a href="{raw_json}">Raw JSON</a> · <a href="{raw_jsonl}">Raw JSONL</a></p>
+            </section>
+            <section>
+              <h2>Chunks</h2>
+              {chunk_html}
+            </section>
+            "#,
+            nav_html = render_nav("/ui", Some(&title)),
+            title = html_escape(&title),
+            thread_id = html_escape(&thread_id),
+            updated = html_escape(&fmt_ts(updated_at.or(created_at))),
+            model = html_escape(display_str(model.as_deref().or(model_provider.as_deref()))),
+            cwd = html_escape(display_str(cwd.as_deref())),
+            git_branch = html_escape(display_str(git_branch.as_deref())),
+            raw_json = raw_json,
+            raw_jsonl = raw_jsonl,
+            chunk_html = chunk_html,
+        ),
+    )
+}
+
+fn render_page(title: &str, body: &str) -> Html<String> {
+    Html(format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <style>
+    :root {{ color-scheme: light dark; }}
+    body {{ font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; line-height: 1.45; }}
+    nav {{ display: flex; gap: 1rem; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap; }}
+    nav form {{ margin: 0; }}
+    h1, h2 {{ margin-bottom: 0.5rem; }}
+    .muted, .meta {{ color: #666; }}
+    .meta {{ font-size: 0.95rem; }}
+    .stack {{ display: grid; gap: 0.75rem; max-width: 36rem; }}
+    .compact {{ grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); align-items: end; }}
+    label {{ display: grid; gap: 0.25rem; font-weight: 600; }}
+    input, select, button {{ font: inherit; padding: 0.45rem 0.6rem; }}
+    button {{ cursor: pointer; }}
+    .list {{ list-style: none; padding: 0; display: grid; gap: 1rem; }}
+    .list li {{ border-top: 1px solid #ccc; padding-top: 1rem; }}
+    .badge {{ font-size: 0.8rem; border: 1px solid #888; padding: 0.1rem 0.4rem; border-radius: 999px; }}
+    .facts {{ display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1rem; }}
+    .facts dt {{ font-weight: 700; }}
+    .chunk {{ border-top: 1px solid #ccc; padding: 1rem 0; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; margin: 0.4rem 0 0; }}
+    .error {{ color: #b00020; font-weight: 600; }}
+  </style>
+</head>
+<body>
+{body}
+</body>
+</html>"#,
+        title = html_escape(title),
+        body = body,
+    ))
+}
+
+fn render_nav(active: &str, query_hint: Option<&str>) -> String {
+    format!(
+        r#"<nav>
+            <a href="/ui"{threads_class}>Threads</a>
+            <a href="/ui/search"{search_class}>Search</a>
+            <form method="post" action="/ui/logout"><button type="submit">Log out</button></form>
+            <span class="meta">{hint}</span>
+          </nav>"#,
+        threads_class = if active == "/ui" {
+            " aria-current=\"page\""
+        } else {
+            ""
+        },
+        search_class = if active == "/ui/search" {
+            " aria-current=\"page\""
+        } else {
+            ""
+        },
+        hint = html_escape(query_hint.unwrap_or("")),
+    )
+}
+
+fn render_scope_options(selected: SearchScope) -> String {
+    let scopes = [
+        (SearchScope::All, "all"),
+        (SearchScope::Decisions, "decisions"),
+        (SearchScope::Problems, "problems"),
+        (SearchScope::Commands, "commands"),
+        (SearchScope::Today, "today"),
+        (SearchScope::Recent, "recent"),
+    ];
+    scopes
+        .into_iter()
+        .map(|(scope, label)| {
+            format!(
+                "<option value=\"{label}\"{selected}>{label}</option>",
+                label = label,
+                selected = selected_attr(scope == selected)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn selected_attr(selected: bool) -> &'static str {
+    if selected {
+        " selected"
+    } else {
+        ""
+    }
+}
+
+fn display_str(value: Option<&str>) -> &str {
+    value.filter(|text| !text.trim().is_empty()).unwrap_or("-")
+}
+
+fn fmt_ts(value: Option<DateTime<Utc>>) -> String {
+    value
+        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 async fn upsert_machine(
@@ -1536,7 +2031,7 @@ async fn upload_openai_batch_file(state: &AppState, payload: Vec<u8>) -> Result<
         .post("https://api.openai.com/v1/files")
         .bearer_auth(&state.openai_api_key)
         .multipart(
-            Form::new().text("purpose", "batch").part(
+            MultipartForm::new().text("purpose", "batch").part(
                 "file",
                 Part::bytes(payload)
                     .file_name("archive-embeddings.jsonl")
@@ -2075,6 +2570,43 @@ fn require_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
     }
 }
 
+fn require_read_access(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
+    if has_read_access(headers, expected) {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+fn has_read_access(headers: &HeaderMap, expected: &str) -> bool {
+    authorization_matches(headers, expected)
+        || cookie_value(headers, READ_COOKIE_NAME) == Some(expected)
+}
+
+fn authorization_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        == Some(expected)
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie_header.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        if name == key {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn auth_cookie(token: &str) -> String {
+    format!("{READ_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+}
+
 fn postgres_jsonb(value: &Value) -> Value {
     let mut value = value.clone();
     sanitize_json_for_postgres(&mut value);
@@ -2288,5 +2820,25 @@ mod tests {
 
         assert_eq!(sanitized["payload"]["text"], "before\\u0000after");
         assert_eq!(sanitized["payload"]["nested"][1], "\\u0000");
+    }
+
+    #[test]
+    fn html_escape_handles_important_characters() {
+        assert_eq!(
+            html_escape("<tag attr='x'>&\""),
+            "&lt;tag attr=&#39;x&#39;&gt;&amp;&quot;"
+        );
+    }
+
+    #[test]
+    fn cookie_value_extracts_named_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("theme=dark; archive_read_token=secret-token; other=1"),
+        );
+
+        assert_eq!(cookie_value(&headers, READ_COOKIE_NAME), Some("secret-token"));
+        assert_eq!(cookie_value(&headers, "missing"), None);
     }
 }

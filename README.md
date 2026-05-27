@@ -130,6 +130,7 @@ cargo run -p archive-agent -- prune \
 
 ## HTTP
 
+- `GET /ui` for a tiny server-rendered browser UI
 - `POST /v1/ingest/batch`
 - `GET /v1/ingest/cursors?machine_id=...`
 - `GET /v1/sync/status`
