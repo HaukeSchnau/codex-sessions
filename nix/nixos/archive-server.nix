@@ -152,6 +152,7 @@ in
     services.postgresql = lib.mkIf cfg.database.local.enable {
       enable = true;
       package = pkgs.postgresql_16.withPackages (ps: [ ps.pgvector ]);
+      extensions = ps: [ ps.pgvector ];
       ensureDatabases = [ cfg.database.name ];
       ensureUsers = [
         {
@@ -166,6 +167,28 @@ in
 
     networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
 
+    systemd.services.codex-session-archive-db-init = lib.mkIf cfg.database.local.enable {
+      description = "Prepare Codex Session Archive database";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "postgresql.service" ];
+      after = [
+        "postgresql.service"
+        "postgresql-setup.service"
+      ];
+      before = [ "codex-session-archive.service" ];
+
+      script = ''
+        ${config.services.postgresql.package}/bin/psql ${lib.escapeShellArg cfg.database.name} \
+          --command 'CREATE EXTENSION IF NOT EXISTS vector'
+      '';
+
+      serviceConfig = {
+        Type = "oneshot";
+        User = "postgres";
+        Group = "postgres";
+      };
+    };
+
     systemd.services.codex-session-archive = {
       description = "Codex Session Archive Server";
       wantedBy = [ "multi-user.target" ];
@@ -173,6 +196,7 @@ in
         "network-online.target"
       ]
       ++ lib.optionals cfg.database.local.enable [
+        "codex-session-archive-db-init.service"
         "postgresql.service"
         "postgresql-setup.service"
       ];
@@ -180,6 +204,7 @@ in
         "network-online.target"
       ]
       ++ lib.optionals cfg.database.local.enable [
+        "codex-session-archive-db-init.service"
         "postgresql.service"
         "postgresql-setup.service"
       ];
