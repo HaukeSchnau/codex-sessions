@@ -5,7 +5,12 @@
   };
 
   outputs =
-    { nixpkgs, flake-utils, ... }:
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      ...
+    }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
@@ -18,10 +23,7 @@
             let
               rel = lib.removePrefix ((toString ./.) + "/") (toString path);
             in
-            rel == "Cargo.lock"
-            || rel == "Cargo.toml"
-            || rel == "crates"
-            || lib.hasPrefix "crates/" rel;
+            rel == "Cargo.lock" || rel == "Cargo.toml" || rel == "crates" || lib.hasPrefix "crates/" rel;
         };
         mkArchiveCrate =
           targetPkgs: crateName:
@@ -30,8 +32,14 @@
             version = "0.1.0";
             src = archiveSource;
             cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = [ "-p" crateName ];
-            cargoTestFlags = [ "-p" crateName ];
+            cargoBuildFlags = [
+              "-p"
+              crateName
+            ];
+            cargoTestFlags = [
+              "-p"
+              crateName
+            ];
             doCheck = true;
           };
         archiveServerPackage = mkArchiveCrate pkgs "archive-server";
@@ -131,5 +139,9 @@
           ];
         };
       }
-    );
+    )
+    // {
+      nixosModules.archive-server = import ./nix/nixos/archive-server.nix { inherit self; };
+      homeManagerModules.archive-agent = import ./nix/home-manager/archive-agent.nix { inherit self; };
+    };
 }
