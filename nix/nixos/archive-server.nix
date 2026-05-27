@@ -172,11 +172,17 @@ in
       wants = [
         "network-online.target"
       ]
-      ++ lib.optionals cfg.database.local.enable [ "postgresql.service" ];
+      ++ lib.optionals cfg.database.local.enable [
+        "postgresql.service"
+        "postgresql-setup.service"
+      ];
       after = [
         "network-online.target"
       ]
-      ++ lib.optionals cfg.database.local.enable [ "postgresql.service" ];
+      ++ lib.optionals cfg.database.local.enable [
+        "postgresql.service"
+        "postgresql-setup.service"
+      ];
 
       environment = {
         ARCHIVE_MAX_INGEST_BODY_BYTES = toString cfg.maxIngestBodyBytes;
