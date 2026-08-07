@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "project": "codex-sessions",
+  "secrets": {
+    "ingest-token": {
+      "description": "Bearer token accepted by the archive ingestion API."
+    },
+    "openai-api-key": {
+      "description": "OpenAI API key used to create semantic-search embeddings."
+    },
+    "read-token": {
+      "description": "Bearer token accepted by archive read and query APIs."
+    }
+  },
+  "parameters": {
+    "embedding-backend": {
+      "type": "string",
+      "default": "batch",
+      "description": "Backend used for chunk embedding jobs."
+    },
+    "embedding-batch-max-requests": {
+      "type": "integer",
+      "default": 512,
+      "description": "Maximum requests in one OpenAI Batch submission."
+    },
+    "embedding-batch-poll-seconds": {
+      "type": "integer",
+      "default": 30,
+      "description": "Polling interval for OpenAI Batch results."
+    },
+    "embedding-dimensions": {
+      "type": "integer",
+      "default": 1536,
+      "description": "Embedding dimensions expected by the database schema."
+    },
+    "embedding-model": {
+      "type": "string",
+      "default": "text-embedding-3-small",
+      "description": "OpenAI embedding model used for semantic search."
+    },
+    "max-ingest-body-bytes": {
+      "type": "integer",
+      "default": 67108864,
+      "description": "Maximum accepted archive ingestion request size."
+    }
+  },
+  "release": {
+    "package": "archive-server",
+    "executable": "archive-server",
+    "health": {
+      "paths": ["/healthz"]
+    }
+  }
+}

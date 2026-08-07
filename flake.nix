@@ -2,6 +2,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    nix-infra-modules = {
+      url = "github:HaukeSchnau/nix-infra-modules";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -9,6 +13,7 @@
       self,
       nixpkgs,
       flake-utils,
+      nix-infra-modules,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -16,6 +21,10 @@
       let
         pkgs = import nixpkgs { inherit system; };
         lib = pkgs.lib;
+        projectDescriptor = nix-infra-modules.lib.projectDescriptor.load {
+          path = ./project.json;
+          expectedProject = "codex-sessions";
+        };
         archiveSource = lib.cleanSourceWith {
           src = ./.;
           filter =
@@ -144,11 +153,31 @@
             sqlx-cli
           ];
         };
+
+        checks.projectDescriptor =
+          pkgs.runCommand "codex-sessions-project-descriptor"
+            {
+              descriptor = pkgs.writeText "project.json" (builtins.toJSON projectDescriptor);
+              nativeBuildInputs = [ pkgs.jq ];
+            }
+            ''
+              jq -e '
+                .project == "codex-sessions"
+                and .release.package == "archive-server"
+                and .release.executable == "archive-server"
+                and .release.health.paths == ["/healthz"]
+                and (.secrets | keys) == ["ingest-token", "openai-api-key", "read-token"]
+              ' "$descriptor" >/dev/null
+              touch "$out"
+            '';
       }
     )
     // {
+      lib.project = builtins.fromJSON (builtins.readFile ./project.json);
       nixosModules.archive-server = import ./nix/nixos/archive-server.nix { inherit self; };
-      homeManagerModules.codex-session-archive-agent = import ./nix/home-manager/archive-agent.nix { inherit self; };
+      homeManagerModules.codex-session-archive-agent = import ./nix/home-manager/archive-agent.nix {
+        inherit self;
+      };
       homeManagerModules.archive-agent = self.homeManagerModules.codex-session-archive-agent;
     };
 }
