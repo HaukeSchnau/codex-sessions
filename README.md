@@ -10,9 +10,39 @@ Central archive/search service for Codex rollout JSONL.
 
 ## Server
 
-## Local Stack
+## Declarative Development
 
-This repo can run its required services with Docker Compose. The archive service image is built by Nix; there is no Dockerfile build path.
+The schema v2 Project descriptor defines a paired Development realization next
+to the existing immutable Release. Development consists of two Workloads:
+
+- `postgres`, a private TCP Endpoint running PostgreSQL 16 with `pgvector`
+- `web`, a hot-reloading `cargo watch` server that depends on `postgres` and is
+  ready when `/readyz` can reach the database
+
+The Project Runtime allocates listeners for each checkout or worktree. Postgres
+stores its cluster below `PROJECT_STATE_DIR`, while Cargo registry and build
+artifacts live below `PROJECT_CACHE_DIR`. Suspending Development therefore stops
+the processes without discarding the database or the next-build cache.
+
+Managed infrastructure supplies the three declared Project Secrets. For an
+unmanaged local run, export their conventional environment-variable fallbacks:
+
+```sh
+export ARCHIVE_INGEST_TOKEN=change-me-ingest
+export ARCHIVE_READ_TOKEN=change-me-read
+export OPENAI_API_KEY=sk-...
+nix run .#dev
+```
+
+`nix run .#dev-web` starts `web` and its `postgres` dependency. `nix run
+.#dev-postgres` starts only Postgres. Listener ports, `DATABASE_URL`, `BIND_ADDR`,
+embedding settings, and Secret-file translation are derived inside repository
+actions through `project-context`; none are host configuration concerns.
+
+## Compose compatibility
+
+This repo can also run its required services with Docker Compose. The archive
+service image is built by Nix; there is no Dockerfile build path.
 
 ```sh
 ./scripts/dev-up

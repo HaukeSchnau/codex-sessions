@@ -107,6 +107,13 @@
               exit 1
             '';
         archiveServerImage = mkArchiveServerImage pkgs;
+        developmentRuntime = import ./nix/project-runtime.nix {
+          inherit
+            lib
+            nix-infra-modules
+            pkgs
+            ;
+        };
       in
       {
         packages = {
@@ -116,9 +123,10 @@
           codex-session-archive-agent = codexSessionArchiveAgentPackage;
           archive-agent = codexSessionArchiveAgentPackage;
           archive-server-image = archiveServerImage;
+          projectRuntime = developmentRuntime.package;
         };
 
-        apps = {
+        apps = developmentRuntime.apps // {
           archive-server = {
             type = "app";
             program = "${archiveServerPackage}/bin/archive-server";
@@ -140,6 +148,7 @@
           packages = with pkgs; [
             cargo
             cargo-nextest
+            cargo-watch
             clippy
             age
             docker-compose
@@ -154,22 +163,38 @@
           ];
         };
 
-        checks.projectDescriptor =
-          pkgs.runCommand "codex-sessions-project-descriptor"
-            {
-              descriptor = pkgs.writeText "project.json" (builtins.toJSON projectDescriptor);
-              nativeBuildInputs = [ pkgs.jq ];
-            }
-            ''
-              jq -e '
-                .project == "codex-sessions"
-                and .release.package == "archive-server"
-                and .release.executable == "archive-server"
-                and .release.health.paths == ["/healthz"]
-                and (.secrets | keys) == ["ingest-token", "openai-api-key", "read-token"]
-              ' "$descriptor" >/dev/null
-              touch "$out"
-            '';
+        checks = developmentRuntime.checks // {
+          projectDescriptor =
+            pkgs.runCommand "codex-sessions-project-descriptor"
+              {
+                descriptor = pkgs.writeText "project.json" (builtins.toJSON projectDescriptor);
+                nativeBuildInputs = [ pkgs.jq ];
+              }
+              ''
+                jq -e '
+                  .schemaVersion == 2
+                  and .project == "codex-sessions"
+                  and .development.workloads.postgres.action == "postgres"
+                  and .development.workloads.web.action == "web"
+                  and .development.workloads.web.dependsOn == ["postgres"]
+                  and .development.workloads.web.secrets == ["ingest-token", "openai-api-key", "read-token"]
+                  and .development.endpoints.postgres.protocol == "tcp"
+                  and (.development.endpoints.postgres.health | has("paths") | not)
+                  and .development.endpoints.web.protocol == "http"
+                  and .development.endpoints.web.health.paths == ["/readyz"]
+                  and .release.package == "archive-server"
+                  and .release.executable == "archive-server"
+                  and .release.health.paths == ["/healthz"]
+                  and (.secrets | keys) == ["ingest-token", "openai-api-key", "read-token"]
+                ' "$descriptor" >/dev/null
+                jq -e '.release == {
+                  package: "archive-server",
+                  executable: "archive-server",
+                  health: {paths: ["/healthz"]}
+                }' ${./project.json} >/dev/null
+                touch "$out"
+              '';
+        };
       }
     )
     // {

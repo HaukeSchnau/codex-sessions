@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "project": "codex-sessions",
   "secrets": {
     "ingest-token": {
@@ -42,6 +42,35 @@
       "type": "integer",
       "default": 67108864,
       "description": "Maximum accepted archive ingestion request size."
+    }
+  },
+  "development": {
+    "preparation": {
+      "action": "prepare",
+      "timeoutSec": 1800
+    },
+    "workloads": {
+      "postgres": {
+        "action": "postgres"
+      },
+      "web": {
+        "action": "web",
+        "dependsOn": ["postgres"],
+        "secrets": ["ingest-token", "openai-api-key", "read-token"]
+      }
+    },
+    "endpoints": {
+      "postgres": {
+        "protocol": "tcp",
+        "workload": "postgres"
+      },
+      "web": {
+        "workload": "web",
+        "health": {
+          "paths": ["/readyz"],
+          "startupTimeoutSec": 900
+        }
+      }
     }
   },
   "release": {
