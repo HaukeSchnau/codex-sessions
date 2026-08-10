@@ -8,11 +8,13 @@ let
   postgres = pkgs.postgresql_16.withPackages (extensions: [ extensions.pgvector ]);
 
   cargoEnvironment = ''
-    export CARGO_HOME="$PROJECT_CACHE_DIR/cargo-home"
-    export CARGO_TARGET_DIR="$PROJECT_CACHE_DIR/cargo-target"
+    checkout="$(project-context path checkout)"
+    cache_root="$(project-context path cache)"
+    export CARGO_HOME="$cache_root/cargo-home"
+    export CARGO_TARGET_DIR="$cache_root/cargo-target"
     export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
     install -d -m 0700 "$CARGO_HOME" "$CARGO_TARGET_DIR"
-    cd "$PROJECT_CHECKOUT"
+    cd "$checkout"
   '';
 
   prepareAction = pkgs.writeShellApplication {
@@ -27,7 +29,7 @@ let
     text = ''
       ${cargoEnvironment}
 
-      preparation_state="$PROJECT_CACHE_DIR/preparation"
+      preparation_state="$cache_root/preparation"
       stamp_file="$preparation_state/dependencies.sha256"
       host_target="$(rustc -vV | sed -n 's/^host: //p')"
       dependency_key=$(
@@ -60,15 +62,17 @@ let
       postgres
     ];
     text = ''
-      listen_host="$($PROJECT_RUNTIME_QUERY endpoint postgres listen-host)"
-      listen_port="$($PROJECT_RUNTIME_QUERY endpoint postgres listen-port)"
-      data_dir="$PROJECT_STATE_DIR/postgres"
-      socket_dir="$PROJECT_RUNTIME_DIR/postgres"
-      bootstrap_socket_dir="$PROJECT_RUNTIME_DIR/postgres-bootstrap"
+      state_root="$(project-context path state)"
+      runtime_root="$(project-context path runtime)"
+      listen_host="$(project-context endpoint postgres listen-host)"
+      listen_port="$(project-context endpoint postgres listen-port)"
+      data_dir="$state_root/postgres"
+      socket_dir="$runtime_root/postgres"
+      bootstrap_socket_dir="$runtime_root/postgres-bootstrap"
       bootstrap_marker="$data_dir/.project-initialized"
-      log_file="$PROJECT_STATE_DIR/postgres.log"
+      log_file="$state_root/postgres.log"
 
-      install -d -m 0700 "$PROJECT_STATE_DIR" "$PROJECT_RUNTIME_DIR" "$socket_dir"
+      install -d -m 0700 "$state_root" "$runtime_root" "$socket_dir"
 
       if [[ ! -s "$data_dir/PG_VERSION" ]]; then
         initdb \
@@ -142,7 +146,7 @@ let
         local secret_file
         local environment_value
 
-        if secret_file="$($PROJECT_RUNTIME_QUERY secret-file "$semantic_name")"; then
+        if secret_file="$(project-context secret-file "$semantic_name")"; then
           if [[ ! -s "$secret_file" ]]; then
             echo "Project Secret is empty: $semantic_name" >&2
             return 66
@@ -166,22 +170,22 @@ let
         esac
       }
 
-      database_host="$($PROJECT_RUNTIME_QUERY endpoint postgres listen-host)"
-      database_port="$($PROJECT_RUNTIME_QUERY endpoint postgres listen-port)"
-      web_host="$($PROJECT_RUNTIME_QUERY endpoint web listen-host)"
-      web_port="$($PROJECT_RUNTIME_QUERY endpoint web listen-port)"
+      database_host="$(project-context endpoint postgres listen-host)"
+      database_port="$(project-context endpoint postgres listen-port)"
+      web_host="$(project-context endpoint web listen-host)"
+      web_port="$(project-context endpoint web listen-port)"
 
       DATABASE_URL="postgresql://codex_archive@$(format_host "$database_host"):$database_port/codex_archive"
       BIND_ADDR="$(format_host "$web_host"):$web_port"
       ARCHIVE_INGEST_TOKEN="$(secret_value ingest-token ARCHIVE_INGEST_TOKEN)"
       ARCHIVE_READ_TOKEN="$(secret_value read-token ARCHIVE_READ_TOKEN)"
       OPENAI_API_KEY="$(secret_value openai-api-key OPENAI_API_KEY)"
-      OPENAI_EMBEDDING_BACKEND="$($PROJECT_RUNTIME_QUERY parameter embedding-backend)"
-      OPENAI_EMBEDDING_MODEL="$($PROJECT_RUNTIME_QUERY parameter embedding-model)"
-      OPENAI_EMBEDDING_BATCH_MAX_REQUESTS="$($PROJECT_RUNTIME_QUERY parameter embedding-batch-max-requests)"
-      OPENAI_EMBEDDING_BATCH_POLL_SECONDS="$($PROJECT_RUNTIME_QUERY parameter embedding-batch-poll-seconds)"
-      EMBEDDING_DIMENSIONS="$($PROJECT_RUNTIME_QUERY parameter embedding-dimensions)"
-      ARCHIVE_MAX_INGEST_BODY_BYTES="$($PROJECT_RUNTIME_QUERY parameter max-ingest-body-bytes)"
+      OPENAI_EMBEDDING_BACKEND="$(project-context parameter embedding-backend)"
+      OPENAI_EMBEDDING_MODEL="$(project-context parameter embedding-model)"
+      OPENAI_EMBEDDING_BATCH_MAX_REQUESTS="$(project-context parameter embedding-batch-max-requests)"
+      OPENAI_EMBEDDING_BATCH_POLL_SECONDS="$(project-context parameter embedding-batch-poll-seconds)"
+      EMBEDDING_DIMENSIONS="$(project-context parameter embedding-dimensions)"
+      ARCHIVE_MAX_INGEST_BODY_BYTES="$(project-context parameter max-ingest-body-bytes)"
       RUST_LOG="''${RUST_LOG:-archive_server=info,tower_http=info}"
       export \
         ARCHIVE_INGEST_TOKEN \

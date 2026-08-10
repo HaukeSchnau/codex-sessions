@@ -20,8 +20,8 @@ to the existing immutable Release. Development consists of two Workloads:
   ready when `/readyz` can reach the database
 
 The Project Runtime allocates listeners for each checkout or worktree. Postgres
-stores its cluster below `PROJECT_STATE_DIR`, while Cargo registry and build
-artifacts live below `PROJECT_CACHE_DIR`. Suspending Development therefore stops
+stores its cluster in Project State, while Cargo registry and build artifacts
+live in Project Cache. Suspending Development therefore stops
 the processes without discarding the database or the next-build cache.
 
 Managed infrastructure supplies the three declared Project Secrets. For an

@@ -48,16 +48,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1786278323,
-        "narHash": "sha256-+Ngspkk0D/xbnYBARiWeXyMlVquF57Q9fZDhQg/n84o=",
+        "lastModified": 1786351698,
+        "narHash": "sha256-YemZyjjKenigOM0cGo01yWmhjqnUEvGVaTCjl/+VnyA=",
         "owner": "HaukeSchnau",
         "repo": "nix-infra-modules",
-        "rev": "a98ffae74550ae7a77933e3f61e500323826dcb7",
+        "rev": "c2998d026da5c5c4403269f2135d94a9e7c1f7cb",
         "type": "github"
       },
       "original": {
         "owner": "HaukeSchnau",
         "repo": "nix-infra-modules",
+        "rev": "c2998d026da5c5c4403269f2135d94a9e7c1f7cb",
         "type": "github"
       }
     },
