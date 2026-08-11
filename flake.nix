@@ -3,7 +3,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     nix-infra-modules = {
-      url = "github:HaukeSchnau/nix-infra-modules/c2998d026da5c5c4403269f2135d94a9e7c1f7cb";
+      url = "github:HaukeSchnau/nix-infra-modules/e5c8324d6e4a4b114e991466b40b22d9ffa8913b";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
