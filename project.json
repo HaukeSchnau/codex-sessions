@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/HaukeSchnau/nix-infra-modules/139d103e82f8be337f6420d13e37573b7b91d9c2/schemas/project-descriptor/v2.json",
+  "$schema": "https://raw.githubusercontent.com/HaukeSchnau/nix-infra-modules/main/schemas/project-descriptor/v2.json",
   "schemaVersion": 2,
   "project": "codex-sessions",
   "secrets": {
