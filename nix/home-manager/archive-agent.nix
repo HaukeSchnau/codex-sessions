@@ -64,7 +64,7 @@ in
 
     serverUrl = lib.mkOption {
       type = lib.types.str;
-      example = "http://srv-2:8787";
+      example = "http://archive.example.net:8787";
       description = "Base URL for the central archive server.";
     };
 
